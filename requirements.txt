@@ -1,0 +1,33 @@
+# ── Core API ─────────────────────────────────────────────
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+python-multipart==0.0.18
+pydantic==2.10.4
+pydantic-settings==2.7.1
+
+# ── Async Task Queue ────────────────────────────────────
+celery[redis]==5.4.0
+redis==5.2.1
+
+# ── Audio / DSP Analysis ────────────────────────────────
+librosa==0.10.2.post1
+soundfile==0.12.1
+numpy==1.26.4
+scipy==1.14.1
+
+# ── AI Sound Event Detection ────────────────────────────
+panns-inference==0.1.1
+torch==2.5.1
+torchvision==0.20.1
+torchaudio==2.5.1
+
+# ── Utilities ────────────────────────────────────────────
+python-dotenv==1.0.1
+
+# ── Monitoring (optional) ───────────────────────────────
+flower==2.0.1
+
+# ── Testing ──────────────────────────────────────────────
+pytest==8.3.4
+pytest-asyncio==0.24.0
+httpx==0.28.1

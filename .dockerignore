@@ -1,0 +1,42 @@
+# Ignore Python caches
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Virtual env
+.venv/
+venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+
+# Docker
+docker-compose.override.yml
+
+# Temp files
+/tmp/
+*.wav
+*.ahap
+
+# ML model weights (downloaded at build time)
+*.pth
+*.pt
+
+# Test artifacts
+.pytest_cache/
+htmlcov/
+.coverage

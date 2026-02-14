@@ -1,0 +1,70 @@
+"""Application configuration using pydantic-settings."""
+
+import os
+from pathlib import Path
+from functools import lru_cache
+from pydantic_settings import BaseSettings
+
+
+class Settings(BaseSettings):
+    """App-wide settings loaded from environment / .env file."""
+
+    # ── API ──────────────────────────────────────────────
+    APP_NAME: str = "Haptic Video Analyzer"
+    APP_VERSION: str = "1.0.0"
+    DEBUG: bool = False
+    API_V1_PREFIX: str = "/api/v1"
+    HOST: str = "0.0.0.0"
+    PORT: int = 8000
+
+    # ── File Storage ─────────────────────────────────────
+    UPLOAD_DIR: str = "/tmp/haptic-jobs/uploads"
+    RESULTS_DIR: str = "/tmp/haptic-jobs/results"
+    MAX_UPLOAD_SIZE_MB: int = 500  # max video file size
+    ALLOWED_EXTENSIONS: list[str] = [
+        ".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v", ".flv",
+    ]
+
+    # ── Celery / Redis ───────────────────────────────────
+    REDIS_URL: str = "redis://localhost:6379/0"
+    CELERY_BROKER_URL: str = "redis://localhost:6379/0"
+    CELERY_RESULT_BACKEND: str = "redis://localhost:6379/0"
+
+    # ── Audio Analysis ───────────────────────────────────
+    AUDIO_SAMPLE_RATE: int = 22050        # librosa default
+    PANNS_SAMPLE_RATE: int = 32000        # PANNs CNN14 expects 32 kHz
+    HOP_LENGTH: int = 512                 # ~23 ms at 22050 Hz
+    FRAME_DURATION_MS: float = 23.2       # hop_length / sr * 1000
+
+    # ── Haptic Generation ────────────────────────────────
+    DEFAULT_SENSITIVITY: float = 0.5      # 0-1, controls threshold
+    MIN_TRANSIENT_INTERVAL_MS: float = 50 # debounce between taps
+    SILENCE_RMS_THRESHOLD: float = 0.01   # below = silence
+    SPEECH_SUPPRESSION_FACTOR: float = 0.05  # near-zero for dialogue
+    MAX_AHAP_EVENTS_PER_CHUNK: int = 128  # Apple limit per pattern
+    AHAP_CHUNK_DURATION_S: float = 30.0   # Apple limit per pattern
+
+    # ── PANNs Model ──────────────────────────────────────
+    PANNS_MODEL_NAME: str = "Cnn14_mAP=0.431.pth"
+    PANNS_CHECKPOINT_PATH: str | None = None  # auto-downloaded if None
+
+    # ── AWS (optional, for S3 storage) ───────────────────
+    AWS_ACCESS_KEY_ID: str | None = None
+    AWS_SECRET_ACCESS_KEY: str | None = None
+    AWS_REGION: str = "us-east-1"
+    S3_BUCKET: str | None = None
+
+    class Config:
+        env_file = ".env"
+        env_file_encoding = "utf-8"
+        case_sensitive = True
+
+
+@lru_cache()
+def get_settings() -> Settings:
+    """Return cached settings singleton."""
+    settings = Settings()
+    # Ensure directories exist
+    os.makedirs(settings.UPLOAD_DIR, exist_ok=True)
+    os.makedirs(settings.RESULTS_DIR, exist_ok=True)
+    return settings

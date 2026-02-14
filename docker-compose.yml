@@ -1,0 +1,81 @@
+services:
+  # ── Redis (message broker + result backend) ────────────
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  # ── FastAPI server ─────────────────────────────────────
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      - upload_data:/tmp/haptic-jobs/uploads
+      - result_data:/tmp/haptic-jobs/results
+    command: >
+      uvicorn app.main:app
+      --host 0.0.0.0
+      --port 8000
+      --workers 2
+
+  # ── Celery worker (runs the heavy analysis pipeline) ───
+  worker:
+    build: .
+    env_file:
+      - .env
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      - upload_data:/tmp/haptic-jobs/uploads
+      - result_data:/tmp/haptic-jobs/results
+    command: >
+      celery -A app.core.celery_app:celery_app worker
+      --loglevel=info
+      --concurrency=2
+      --max-tasks-per-child=10
+      --queues=celery
+
+  # ── (Optional) Celery Flower monitoring UI ─────────────
+  flower:
+    build: .
+    ports:
+      - "5555:5555"
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+    depends_on:
+      redis:
+        condition: service_healthy
+    command: >
+      celery -A app.core.celery_app:celery_app flower
+      --port=5555
+    profiles:
+      - monitoring
+
+volumes:
+  redis_data:
+  upload_data:
+  result_data:
