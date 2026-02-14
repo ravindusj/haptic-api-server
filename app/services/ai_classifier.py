@@ -34,71 +34,71 @@ settings = get_settings()
 
 # ── YAMNet AudioSet class indices (521 classes) ──────────
 
-HAPTIC_WORTHY_CLASSES: dict[int, str] = {
-    # Explosions & impacts
-    420: "Explosion",
-    421: "Gunshot, gunfire",
-    422: "Machine gun",
-    423: "Fusillade",
-    424: "Artillery fire",
-    # Crashes & breaking
-    463: "Smash, crash",
-    454: "Thump, thud",
-    460: "Bang",
-    462: "Whack, thwack",
-    464: "Slap, smack",
-    # Thunder
-    281: "Thunder",
-    282: "Thunderstorm",
-    # Drums & percussion
-    159: "Drum",
-    160: "Snare drum",
-    163: "Bass drum",
-    161: "Rimshot",
-    162: "Drum roll",
-    164: "Cymbal",
-    165: "Hi-hat",
-    166: "Drum kit",
-    # Bass & low-freq instruments
-    153: "Bass guitar",
-    # Guitar / strings
-    135: "Guitar",
-    136: "Electric guitar",
-    137: "Acoustic guitar",
-    147: "Violin, fiddle",
-    148: "Cello",
-    149: "Double bass",
-    150: "Harp",
-    151: "Mandolin",
-    152: "Banjo",
-    154: "Ukulele",
-    # Keyboard instruments
-    141: "Piano",
-    142: "Electric piano",
-    143: "Keyboard (musical)",
-    144: "Organ",
-    145: "Synthesizer",
-    # Vocal (musical — not speech)
-    24: "Singing",
-    # Engine & machinery
-    337: "Engine",
-    338: "Motor vehicle (road)",
-    340: "Car",
-    346: "Motorcycle",
-    348: "Truck",
-    # Music categories
-    489: "Heavy metal",
-    490: "Punk rock",
-    486: "Rock music",
-    487: "Pop music",
-    488: "Hip hop music",
-    491: "Disco",
-    492: "Electronic music",
-    493: "Techno",
-    132: "Music",
-    # Other impacts
-    455: "Knock",
-    456: "Tap",
+HAPTIC_WORTHY_CLASSES: dict[int, tuple[str, float]] = {
+    # Explosions & impacts — weight 3.0 (must produce strong haptic)
+    420: ("Explosion", 3.0),
+    421: ("Gunshot, gunfire", 3.0),
+    422: ("Machine gun", 3.0),
+    423: ("Fusillade", 3.0),
+    424: ("Artillery fire", 3.0),
+    # Crashes & breaking — weight 2.5–3.0
+    463: ("Smash, crash", 3.0),
+    454: ("Thump, thud", 2.5),
+    460: ("Bang", 3.0),
+    462: ("Whack, thwack", 2.5),
+    464: ("Slap, smack", 2.0),
+    # Thunder — weight 3.0
+    281: ("Thunder", 3.0),
+    282: ("Thunderstorm", 3.0),
+    # Drums & percussion — weight 2.0
+    159: ("Drum", 2.0),
+    160: ("Snare drum", 2.0),
+    163: ("Bass drum", 2.0),
+    161: ("Rimshot", 2.0),
+    162: ("Drum roll", 2.0),
+    164: ("Cymbal", 1.5),
+    165: ("Hi-hat", 1.5),
+    166: ("Drum kit", 2.0),
+    # Bass & low-freq instruments — weight 1.5
+    153: ("Bass guitar", 1.5),
+    # Guitar / strings — weight 1.0
+    135: ("Guitar", 1.0),
+    136: ("Electric guitar", 1.2),
+    137: ("Acoustic guitar", 1.0),
+    147: ("Violin, fiddle", 1.0),
+    148: ("Cello", 1.0),
+    149: ("Double bass", 1.5),
+    150: ("Harp", 1.0),
+    151: ("Mandolin", 1.0),
+    152: ("Banjo", 1.0),
+    154: ("Ukulele", 1.0),
+    # Keyboard instruments — weight 1.0
+    141: ("Piano", 1.0),
+    142: ("Electric piano", 1.0),
+    143: ("Keyboard (musical)", 1.0),
+    144: ("Organ", 1.0),
+    145: ("Synthesizer", 1.2),
+    # Vocal (musical — not speech) — weight 1.0
+    24: ("Singing", 1.0),
+    # Engine & machinery — weight 1.5
+    337: ("Engine", 1.5),
+    338: ("Motor vehicle (road)", 1.5),
+    340: ("Car", 1.5),
+    346: ("Motorcycle", 1.5),
+    348: ("Truck", 1.5),
+    # Music categories — weight 1.0–1.5
+    489: ("Heavy metal", 1.5),
+    490: ("Punk rock", 1.5),
+    486: ("Rock music", 1.0),
+    487: ("Pop music", 1.0),
+    488: ("Hip hop music", 1.2),
+    491: ("Disco", 1.0),
+    492: ("Electronic music", 1.2),
+    493: ("Techno", 1.2),
+    132: ("Music", 1.0),
+    # Other impacts — weight 1.5
+    455: ("Knock", 1.5),
+    456: ("Tap", 1.5),
 }
 
 SPEECH_CLASSES: dict[int, str] = {
@@ -339,13 +339,21 @@ def _run_whisper(wav_path: str, duration: float) -> list[SpeechSegment]:
 
 
 def _compute_haptic_score(probs: np.ndarray) -> float:
-    """Aggregate probability of haptic-worthy classes."""
+    """Aggregate weighted probability of haptic-worthy classes.
+
+    Per-class weights emphasise impacts (3×) over ambient music (1×)
+    so explosions/crashes produce much higher scores than gentle
+    instruments sharing the same softmax budget.
+    """
     worthy_indices = [i for i in HAPTIC_WORTHY_CLASSES.keys() if i < len(probs)]
     if not worthy_indices:
         return 0.0
-    worthy_probs = probs[worthy_indices]
-    top_k = min(5, len(worthy_probs))
-    return float(np.clip(np.sort(worthy_probs)[-top_k:].sum(), 0.0, 1.0))
+    # Multiply each class probability by its relevance weight
+    weighted_probs = np.array([
+        probs[i] * HAPTIC_WORTHY_CLASSES[i][1] for i in worthy_indices
+    ])
+    top_k = min(5, len(weighted_probs))
+    return float(np.clip(np.sort(weighted_probs)[-top_k:].sum(), 0.0, 1.0))
 
 
 def _compute_speech_score(probs: np.ndarray) -> float:
@@ -362,7 +370,7 @@ def _get_dominant_class(probs: np.ndarray) -> str:
     top_idx = int(np.argmax(probs))
 
     if top_idx in HAPTIC_WORTHY_CLASSES:
-        return HAPTIC_WORTHY_CLASSES[top_idx]
+        return HAPTIC_WORTHY_CLASSES[top_idx][0]
     if top_idx in NON_WORTHY_CLASSES:
         return NON_WORTHY_CLASSES[top_idx]
     if _yamnet_classes and top_idx < len(_yamnet_classes):

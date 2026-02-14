@@ -96,6 +96,19 @@ def fuse_scores(
     # ── Resample AI scores to DSP frame rate ─────────────
     ai_haptic = _resample_to_length(np.array(ai.haptic_scores), n_frames)
 
+    # ── Resample AI dominant classes to DSP frame rate ───
+    # Nearest-neighbor mapping for semantic sharpness & crash bursts.
+    _ai_n = len(ai.dominant_classes)
+    if _ai_n > 0:
+        _ai_idx = np.clip(
+            (np.arange(n_frames) * frame_dur / ai.frame_duration_s).astype(int),
+            0, _ai_n - 1,
+        )
+        dsp_dominant: list[str] = [ai.dominant_classes[i] for i in _ai_idx]
+    else:
+        _ai_idx = np.zeros(n_frames, dtype=int)
+        dsp_dominant = ["unknown"] * n_frames
+
     # ── Build speech mask from Whisper segments ──────────
     # Whisper gives precise [start, end] timestamps for speech.
     # Convert to per-frame gate: 0 = speech, 1 = non-speech.
@@ -119,7 +132,7 @@ def fuse_scores(
     # ── Haptic-content override ──────────────────────────
     # If YAMNet detects strong haptic content (crash, music, etc.),
     # do NOT let the speech gate kill it — guarantee at least 70%.
-    haptic_override = ai_haptic > 0.06
+    haptic_override = ai_haptic > 0.12
     speech_gate = np.where(haptic_override, np.maximum(speech_gate, 0.70), speech_gate)
 
     # ── Percussive novelty gating ────────────────────────
@@ -153,14 +166,14 @@ def fuse_scores(
 
     # ── Impact amplification ─────────────────────────────
     # When percussive + bass are both strong → genuine impact.
-    # Boost by up to 1.8× so explosions/hits feel powerful.
+    # Boost by up to 2.5× so explosions/hits feel powerful.
     impact_factor = np.where(
-        (perc_rms > 0.12) & (bass > 0.12),
-        1.0 + 0.8 * perc_rms * bass,
+        (perc_rms > 0.06) & (bass > 0.06),
+        1.0 + 1.5 * perc_rms * bass,
         1.0,
     )
     # Percussive-only boost for crashes that lack strong bass
-    perc_only_boost = np.where(perc_rms > 0.35, 1.0 + 0.5 * perc_rms, 1.0)
+    perc_only_boost = np.where(perc_rms > 0.20, 1.0 + 0.8 * perc_rms, 1.0)
     combined *= impact_factor * perc_only_boost
 
     # ── Apply speech gate (once only) ─────────────────────
@@ -173,7 +186,7 @@ def fuse_scores(
 
     # ── Clamp & comfort ceiling ──────────────────────────
     combined = np.clip(combined, 0.0, 1.0)
-    envelope_signal = np.clip(combined, 0.0, 0.95)
+    envelope_signal = combined.copy()
 
     # ── Adaptive rest gate — zero out faint frames ───────
     # Use a low fixed floor plus a fraction of the local median
@@ -203,6 +216,39 @@ def fuse_scores(
     sharpness_smooth_win = max(1, int(0.05 / frame_dur))
     sharpness = _smooth(sharpness, sharpness_smooth_win)
 
+    # ── AI-driven sharpness modulation ───────────────────
+    # Crash/explosion → high sharpness (metallic crunch),
+    # bass/engine → low sharpness (deep rumble),
+    # drums → medium-high (punchy).  Blended 50/50 with spectral.
+    _CRASH_LABELS = {
+        "Explosion", "Smash, crash", "Bang", "Thunder",
+        "Thunderstorm", "Thump, thud", "Whack, thwack",
+        "Slap, smack", "Artillery fire",
+    }
+    _GUNSHOT_LABELS = {"Gunshot, gunfire", "Machine gun", "Fusillade"}
+    _DRUM_LABELS = {
+        "Drum", "Snare drum", "Bass drum", "Rimshot",
+        "Drum roll", "Cymbal", "Hi-hat", "Drum kit",
+    }
+    _DEEP_LABELS = {
+        "Bass guitar", "Double bass", "Engine",
+        "Motor vehicle (road)", "Truck",
+    }
+    if _ai_n > 0:
+        _sem_sharp = np.full(_ai_n, 0.5)
+        for _si, _lbl in enumerate(ai.dominant_classes):
+            if _lbl in _CRASH_LABELS:
+                _sem_sharp[_si] = 0.85
+            elif _lbl in _GUNSHOT_LABELS:
+                _sem_sharp[_si] = 0.95
+            elif _lbl in _DRUM_LABELS:
+                _sem_sharp[_si] = 0.60
+            elif _lbl in _DEEP_LABELS:
+                _sem_sharp[_si] = 0.15
+        semantic_sharpness = _sem_sharp[_ai_idx]
+        sharpness = 0.50 * semantic_sharpness + 0.50 * sharpness
+        sharpness = np.clip(sharpness, 0.05, 0.95)
+
     # ── Downsample to envelope rate (~20 fps) ────────────
     intensity_env, actual_env_fps = _downsample_max(envelope_signal, frame_dur, ENVELOPE_FPS)
     sharpness_env, _ = _downsample_mean(sharpness, frame_dur, ENVELOPE_FPS)
@@ -226,6 +272,8 @@ def fuse_scores(
         beat_times=dsp.beat_times,
         beat_strengths=dsp.beat_strengths,
         speech_gate=speech_gate,
+        ai_haptic=ai_haptic,
+        dsp_dominant=dsp_dominant,
     )
 
     # Compute speech suppression percentage
@@ -315,11 +363,14 @@ def _extract_transient_events(
     beat_times: list[float],
     beat_strengths: list[float],
     speech_gate: np.ndarray | None = None,
+    ai_haptic: np.ndarray | None = None,
+    dsp_dominant: list[str] | None = None,
 ) -> list[HapticEvent]:
     """Extract transient (tap) events from percussive signal.
 
     Transients are accent taps overlaid on the continuous ParameterCurve
     envelope for punchy impact emphasis at onsets and beats.
+    Crash/explosion frames get burst transients for a "shattering" feel.
     """
     events: list[HapticEvent] = []
     frame_dur = hop / sr
@@ -381,6 +432,46 @@ def _extract_transient_events(
                 sharpness=0.5,
             )
         )
+
+    # ── Crash/impact burst transients ────────────────────
+    # When AI detects a crash/explosion with strong confidence,
+    # inject a burst of 3 rapid transients with varied sharpness
+    # (sharp→medium→deep) for a visceral "shattering" feel.
+    _BURST_CLASSES = {
+        "Explosion", "Smash, crash", "Bang", "Thunder",
+        "Thunderstorm", "Gunshot, gunfire", "Machine gun",
+        "Fusillade", "Artillery fire", "Thump, thud",
+        "Whack, thwack", "Slap, smack",
+    }
+    if ai_haptic is not None and dsp_dominant is not None:
+        burst_spacing = 0.030     # 30 ms between burst taps
+        burst_cooldown = 0.50     # max one burst per 500 ms
+        last_burst_t = -1.0
+        burst_sharpness = [0.95, 0.60, 0.25]  # sharp→medium→deep
+        for fi in range(n_frames):
+            if fi >= len(ai_haptic) or fi >= len(dsp_dominant):
+                break
+            if ai_haptic[fi] < 0.15:
+                continue
+            if dsp_dominant[fi] not in _BURST_CLASSES:
+                continue
+            t = fi * frame_dur
+            if (t - last_burst_t) < burst_cooldown:
+                continue
+            for b in range(3):
+                bt = t + b * burst_spacing
+                overlap = any(abs(e.time - bt) < 0.015 for e in events)
+                if overlap:
+                    continue
+                bi = float(np.clip(0.85 + 0.15 * ai_haptic[fi], 0.85, 1.0))
+                events.append(HapticEvent(
+                    time=round(bt, 4),
+                    event_type="transient",
+                    duration=0.0,
+                    intensity=round(bi, 4),
+                    sharpness=burst_sharpness[b],
+                ))
+            last_burst_t = t
 
     events.sort(key=lambda e: e.time)
     return events

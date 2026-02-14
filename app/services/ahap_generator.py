@@ -241,7 +241,7 @@ def _build_pattern(
             "EventDuration": round(chunk_duration, 4),
             "EventParameters": [
                 {"ParameterID": "HapticIntensity", "ParameterValue": 1.0},
-                {"ParameterID": "HapticSharpness", "ParameterValue": 0.5},
+                {"ParameterID": "HapticSharpness", "ParameterValue": 1.0},
             ],
         }
     })
