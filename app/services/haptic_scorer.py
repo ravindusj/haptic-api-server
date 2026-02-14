@@ -234,6 +234,7 @@ def fuse_scores(
         "Bass guitar", "Double bass", "Engine",
         "Motor vehicle (road)", "Truck",
     }
+    _TICK_LABELS = {"Clock", "Tick", "Tick-tock", "Alarm clock"}
     if _ai_n > 0:
         _sem_sharp = np.full(_ai_n, 0.5)
         for _si, _lbl in enumerate(ai.dominant_classes):
@@ -241,6 +242,8 @@ def fuse_scores(
                 _sem_sharp[_si] = 0.85
             elif _lbl in _GUNSHOT_LABELS:
                 _sem_sharp[_si] = 0.95
+            elif _lbl in _TICK_LABELS:
+                _sem_sharp[_si] = 0.90
             elif _lbl in _DRUM_LABELS:
                 _sem_sharp[_si] = 0.60
             elif _lbl in _DEEP_LABELS:

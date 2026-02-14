@@ -99,6 +99,11 @@ HAPTIC_WORTHY_CLASSES: dict[int, tuple[str, float]] = {
     # Other impacts — weight 1.5
     455: ("Knock", 1.5),
     456: ("Tap", 1.5),
+    # Clock & tick-tock — weight 2.0 (crisp rhythmic taps)
+    400: ("Clock", 2.0),
+    401: ("Tick", 2.0),
+    402: ("Tick-tock", 2.0),
+    389: ("Alarm clock", 1.8),
 }
 
 SPEECH_CLASSES: dict[int, str] = {
