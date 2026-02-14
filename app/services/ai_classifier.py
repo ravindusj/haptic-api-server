@@ -344,8 +344,8 @@ def _compute_haptic_score(probs: np.ndarray) -> float:
     if not worthy_indices:
         return 0.0
     worthy_probs = probs[worthy_indices]
-    top_k = min(3, len(worthy_probs))
-    return float(np.sort(worthy_probs)[-top_k:].mean())
+    top_k = min(5, len(worthy_probs))
+    return float(np.clip(np.sort(worthy_probs)[-top_k:].sum(), 0.0, 1.0))
 
 
 def _compute_speech_score(probs: np.ndarray) -> float:

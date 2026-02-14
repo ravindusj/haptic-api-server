@@ -39,7 +39,7 @@ class Settings(BaseSettings):
     # ── Haptic Generation ────────────────────────────────
     DEFAULT_SENSITIVITY: float = 0.5      # 0-1, controls threshold
     MIN_TRANSIENT_INTERVAL_MS: float = 50 # debounce between taps
-    SILENCE_RMS_THRESHOLD: float = 0.01   # below = silence (raw RMS)
+    SILENCE_RMS_THRESHOLD: float = 0.003  # below = silence (raw RMS)
     SPEECH_SUPPRESSION_FACTOR: float = 0.05  # near-zero for dialogue
     MAX_AHAP_EVENTS_PER_CHUNK: int = 128  # Apple limit per pattern
     AHAP_CHUNK_DURATION_S: float = 30.0   # Apple limit per pattern

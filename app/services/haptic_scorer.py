@@ -107,14 +107,20 @@ def fuse_scores(
 
     # Merge with YAMNet speech scores as a backup
     ai_speech = _resample_to_length(np.array(ai.speech_scores), n_frames)
-    yamnet_gate = 1.0 - np.clip((ai_speech - 0.4) / 0.3, 0.0, 1.0)
+    yamnet_gate = 1.0 - np.clip((ai_speech - 0.5) / 0.4, 0.0, 1.0)
     # Take the more suppressive of the two gates
     speech_gate = np.minimum(speech_gate, yamnet_gate)
 
     # Smooth gate edges (~80 ms crossfade)
     gate_smooth = max(1, int(0.08 / frame_dur))
     speech_gate = _smooth(speech_gate, gate_smooth)
-    speech_gate = np.where(speech_gate < 0.10, 0.0, speech_gate)
+    speech_gate = np.where(speech_gate < 0.05, 0.0, speech_gate)
+
+    # ── Haptic-content override ──────────────────────────
+    # If YAMNet detects strong haptic content (crash, music, etc.),
+    # do NOT let the speech gate kill it — guarantee at least 70%.
+    haptic_override = ai_haptic > 0.06
+    speech_gate = np.where(haptic_override, np.maximum(speech_gate, 0.70), speech_gate)
 
     # ── Percussive novelty gating ────────────────────────
     # Constant percussive energy (machine hum, engine) → suppress.
@@ -149,11 +155,13 @@ def fuse_scores(
     # When percussive + bass are both strong → genuine impact.
     # Boost by up to 1.8× so explosions/hits feel powerful.
     impact_factor = np.where(
-        (perc_rms > 0.25) & (bass > 0.25),
+        (perc_rms > 0.12) & (bass > 0.12),
         1.0 + 0.8 * perc_rms * bass,
         1.0,
     )
-    combined *= impact_factor
+    # Percussive-only boost for crashes that lack strong bass
+    perc_only_boost = np.where(perc_rms > 0.35, 1.0 + 0.5 * perc_rms, 1.0)
+    combined *= impact_factor * perc_only_boost
 
     # ── Apply speech gate (once only) ─────────────────────
     combined *= speech_gate
@@ -171,7 +179,7 @@ def fuse_scores(
     # Use a low fixed floor plus a fraction of the local median
     # so quiet-but-real content isn't zeroed after normalisation.
     local_median = np.median(envelope_signal[envelope_signal > 0]) if np.any(envelope_signal > 0) else 0.0
-    rest_threshold = max(0.015, 0.08 * local_median)
+    rest_threshold = min(0.02, max(0.010, 0.05 * local_median))
     envelope_signal[envelope_signal < rest_threshold] = 0.0
 
     # ── Perceptual floor boost ───────────────────────────
