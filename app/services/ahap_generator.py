@@ -368,36 +368,80 @@ def _chunk_to_ahap_dict(chunk: AHAPPattern) -> dict[str, Any]:
 def _build_combined_ahap(ahap: AHAPFile) -> dict[str, Any]:
     """
     Build a single combined AHAP with all events (absolute times).
-    Useful for short-to-medium content or players that handle large patterns.
+
+    Merges all per-chunk ParameterCurves into **one** curve per
+    ParameterID (HapticIntensityControl, HapticSharpnessControl).
+    Apple Core Haptics does not reliably honour multiple
+    ParameterCurves with the same ParameterID — only the first
+    is applied, leaving later chunks without intensity modulation.
     """
-    all_events: list[dict[str, Any]] = []
+    merged_curves: dict[str, list[dict[str, float]]] = {}  # paramID → points
+    event_entries: list[dict[str, Any]] = []
+    continuous_start: float | None = None
+    continuous_end: float = 0.0
 
     for chunk in ahap.chunks:
         for entry in chunk.pattern:
-            # ParameterCurve entries: shift times to absolute
             if "ParameterCurve" in entry:
-                curve = entry["ParameterCurve"].copy()
-                curve["Time"] = round(curve["Time"] + chunk.start_time, 4)
-                adjusted_points = []
+                curve = entry["ParameterCurve"]
+                pid = curve["ParameterID"]
+                if pid not in merged_curves:
+                    merged_curves[pid] = []
                 for pt in curve.get("ParameterCurveControlPoints", []):
-                    adjusted_points.append({
+                    merged_curves[pid].append({
                         "Time": round(pt["Time"] + chunk.start_time, 4),
                         "ParameterValue": pt["ParameterValue"],
                     })
-                curve["ParameterCurveControlPoints"] = adjusted_points
-                all_events.append({"ParameterCurve": curve})
-            # Event entries: shift time to absolute
             elif "Event" in entry:
                 evt = entry["Event"].copy()
                 evt["Time"] = round(evt["Time"] + chunk.start_time, 4)
-                all_events.append({"Event": evt})
+                # Track the full span of HapticContinuous carriers
+                if evt["EventType"] == "HapticContinuous":
+                    if continuous_start is None:
+                        continuous_start = evt["Time"]
+                    continuous_end = max(
+                        continuous_end,
+                        evt["Time"] + evt.get("EventDuration", 0),
+                    )
+                else:
+                    event_entries.append({"Event": evt})
+
+    # ── Single HapticContinuous spanning full duration ───
+    combined_pattern: list[dict[str, Any]] = []
+    total_dur = ahap.total_duration
+    combined_pattern.append({
+        "Event": {
+            "Time": 0.0,
+            "EventType": "HapticContinuous",
+            "EventDuration": round(total_dur, 4),
+            "EventParameters": [
+                {"ParameterID": "HapticIntensity", "ParameterValue": 1.0},
+                {"ParameterID": "HapticSharpness", "ParameterValue": 0.5},
+            ],
+        }
+    })
+
+    # ── One merged ParameterCurve per ID ─────────────────
+    for pid, points in merged_curves.items():
+        # Sort by time and deduplicate
+        points.sort(key=lambda p: p["Time"])
+        combined_pattern.append({
+            "ParameterCurve": {
+                "ParameterID": pid,
+                "Time": 0.0,
+                "ParameterCurveControlPoints": points,
+            }
+        })
+
+    # ── Transient events ─────────────────────────────────
+    combined_pattern.extend(event_entries)
 
     return {
         "Version": 1.0,
         "Metadata": {
-            "TotalDuration": ahap.total_duration,
+            "TotalDuration": total_dur,
             "TotalEvents": ahap.total_events,
             "TotalChunks": len(ahap.chunks),
         },
-        "Pattern": all_events,
+        "Pattern": combined_pattern,
     }

@@ -149,7 +149,7 @@ def fuse_scores(
     )
     combined *= impact_factor
 
-    # ── Apply speech gate ────────────────────────────────
+    # ── Apply speech gate (once only) ─────────────────────
     combined *= speech_gate
 
     # ── Silence gate (raw RMS) ───────────────────────────
@@ -157,16 +157,15 @@ def fuse_scores(
     silence_mask = raw_rms_trimmed < settings.SILENCE_RMS_THRESHOLD
     combined = _apply_silence_fade(combined, silence_mask, fade_frames=3)
 
-    # Re-apply speech gate after silence fade
-    combined *= speech_gate
-    combined = _apply_silence_fade(combined, silence_mask, fade_frames=3)
-
     # ── Clamp & comfort ceiling ──────────────────────────
     combined = np.clip(combined, 0.0, 1.0)
     envelope_signal = np.clip(combined, 0.0, 0.85)
 
-    # ── Rest gate — zero out faint frames ────────────────
-    rest_threshold = 0.04
+    # ── Adaptive rest gate — zero out faint frames ───────
+    # Use a low fixed floor plus a fraction of the local median
+    # so quiet-but-real content isn't zeroed after normalisation.
+    local_median = np.median(envelope_signal[envelope_signal > 0]) if np.any(envelope_signal > 0) else 0.0
+    rest_threshold = max(0.015, 0.08 * local_median)
     envelope_signal[envelope_signal < rest_threshold] = 0.0
 
     # ── Build sharpness from band balance ────────────────
@@ -180,8 +179,8 @@ def fuse_scores(
     sharpness = _smooth(sharpness, sharpness_smooth_win)
 
     # ── Downsample to envelope rate (~20 fps) ────────────
-    intensity_env = _downsample_max(envelope_signal, frame_dur, ENVELOPE_FPS)
-    sharpness_env = _downsample_mean(sharpness, frame_dur, ENVELOPE_FPS)
+    intensity_env, actual_env_fps = _downsample_max(envelope_signal, frame_dur, ENVELOPE_FPS)
+    sharpness_env, _ = _downsample_mean(sharpness, frame_dur, ENVELOPE_FPS)
 
     # ── Extract transient tap events ─────────────────────
     # Boost percussive signal for tap detection
@@ -227,7 +226,7 @@ def fuse_scores(
         events=events,
         intensity_envelope=[round(float(v), 4) for v in intensity_env],
         sharpness_envelope=[round(float(v), 4) for v in sharpness_env],
-        envelope_fps=ENVELOPE_FPS,
+        envelope_fps=actual_env_fps,
         metadata={
             "sensitivity": sensitivity,
             "bass_boost": bass_boost,
@@ -374,26 +373,37 @@ def _boost_array(arr: np.ndarray) -> np.ndarray:
     return np.clip(out, 0.0, 1.0)
 
 
-def _downsample_max(arr: np.ndarray, frame_dur: float, target_fps: float) -> np.ndarray:
-    """Downsample using windowed max-pooling to preserve transient peaks."""
+def _downsample_max(
+    arr: np.ndarray, frame_dur: float, target_fps: float,
+) -> tuple[np.ndarray, float]:
+    """Downsample using windowed max-pooling to preserve transient peaks.
+
+    Returns (downsampled_array, actual_fps) so downstream consumers
+    (AHAP generator) use the *real* effective FPS instead of the
+    target, eliminating progressive time-drift in later chunks.
+    """
     step = max(1, int(round(1.0 / (target_fps * frame_dur))))
+    actual_fps = 1.0 / (step * frame_dur)
     n = len(arr)
     out = []
     for i in range(0, n, step):
         window = arr[i : i + step]
         out.append(float(np.max(window)))
-    return np.array(out)
+    return np.array(out), round(actual_fps, 4)
 
 
-def _downsample_mean(arr: np.ndarray, frame_dur: float, target_fps: float) -> np.ndarray:
+def _downsample_mean(
+    arr: np.ndarray, frame_dur: float, target_fps: float,
+) -> tuple[np.ndarray, float]:
     """Downsample using windowed mean for smoother signals."""
     step = max(1, int(round(1.0 / (target_fps * frame_dur))))
+    actual_fps = 1.0 / (step * frame_dur)
     n = len(arr)
     out = []
     for i in range(0, n, step):
         window = arr[i : i + step]
         out.append(float(np.mean(window)))
-    return np.array(out)
+    return np.array(out), round(actual_fps, 4)
 
 
 def _apply_silence_fade(

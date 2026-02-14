@@ -92,18 +92,19 @@ def analyze_dsp(wav_path: str) -> DSPFeatures:
     # ── Beat Tracking ────────────────────────────────────
     beat_times, beat_strengths = _detect_beats(y_percussive, sr, hop)
 
-    # ── Normalise all arrays ─────────────────────────────
+    # ── Normalise all arrays (sliding-window) ────────────
     n_frames = len(rms)
-    rms_norm = _normalise(rms)
-    harmonic_norm = _normalise(harmonic_rms)
-    percussive_norm = _normalise(percussive_rms)
-    onset_norm = _normalise(percussive_onset)
+    frame_dur = hop / sr  # ~0.023 s per frame
+    rms_norm = _normalise(rms, frame_dur=frame_dur)
+    harmonic_norm = _normalise(harmonic_rms, frame_dur=frame_dur)
+    percussive_norm = _normalise(percussive_rms, frame_dur=frame_dur)
+    onset_norm = _normalise(percussive_onset, frame_dur=frame_dur)
     centroid_norm = _pad_or_trim(centroid_norm, n_frames)
-    flux_norm = _normalise(_pad_or_trim(flux, n_frames))
+    flux_norm = _normalise(_pad_or_trim(flux, n_frames), frame_dur=frame_dur)
 
     band_norms: dict[str, np.ndarray] = {}
     for name, raw in band_energies.items():
-        band_norms[name] = _normalise(_pad_or_trim(raw, n_frames))
+        band_norms[name] = _normalise(_pad_or_trim(raw, n_frames), frame_dur=frame_dur)
 
     # Trim/pad HPSS arrays
     harmonic_norm = _pad_or_trim(harmonic_norm, n_frames)
@@ -149,19 +150,64 @@ def analyze_dsp(wav_path: str) -> DSPFeatures:
 # ── Helpers ──────────────────────────────────────────────
 
 
-def _normalise(arr: np.ndarray, percentile: float = 98) -> np.ndarray:
-    """Percentile-based normalisation to [0, 1].
+def _normalise(
+    arr: np.ndarray,
+    percentile: float = 98,
+    window_sec: float = 30.0,
+    frame_dur: float | None = None,
+) -> np.ndarray:
+    """Sliding-window percentile normalisation to [0, 1].
 
-    Uses the given percentile as the effective max rather than the
-    absolute max, which prevents a single extreme outlier from
-    squashing the entire signal to near-zero.
+    Instead of normalising the *entire* signal by one global percentile
+    (which lets a loud first minute squash everything after it), we
+    normalise each overlapping window independently and blend at the
+    boundaries.  This preserves local dynamics across the full duration.
+
+    For signals shorter than ``window_sec`` the behaviour is identical
+    to the old global normalisation.
     """
-    mn = float(np.min(arr))
-    mx = float(np.percentile(arr, percentile))
-    if mx - mn < 1e-8:
-        return np.zeros_like(arr)
-    normalised = (arr - mn) / (mx - mn)
-    return np.clip(normalised, 0.0, 1.0)
+    n = len(arr)
+    if n == 0:
+        return arr.copy()
+
+    # Determine window size in frames
+    if frame_dur is not None and frame_dur > 0:
+        win_frames = max(1, int(window_sec / frame_dur))
+    else:
+        # Fallback: assume ~43 fps (hop=512, sr=22050)
+        win_frames = max(1, int(window_sec * 43))
+
+    # If signal fits in one window, do simple global normalise
+    if n <= win_frames:
+        mn = float(np.min(arr))
+        mx = float(np.percentile(arr, percentile))
+        if mx - mn < 1e-8:
+            return np.zeros_like(arr)
+        return np.clip((arr - mn) / (mx - mn), 0.0, 1.0)
+
+    # Sliding-window with 50 % overlap & blend
+    step = max(1, win_frames // 2)
+    out = np.zeros(n, dtype=np.float64)
+    weight = np.zeros(n, dtype=np.float64)
+
+    for start in range(0, n, step):
+        end = min(start + win_frames, n)
+        segment = arr[start:end]
+        mn = float(np.min(segment))
+        mx = float(np.percentile(segment, percentile))
+        if mx - mn < 1e-8:
+            normed = np.zeros_like(segment)
+        else:
+            normed = np.clip((segment - mn) / (mx - mn), 0.0, 1.0)
+
+        # Hann-shaped blending window avoids seams
+        w = np.hanning(len(segment) + 2)[1:-1]
+        out[start:end] += normed * w
+        weight[start:end] += w
+
+    # Avoid division by zero at edges
+    weight = np.maximum(weight, 1e-12)
+    return np.clip(out / weight, 0.0, 1.0)
 
 
 def _pad_or_trim(arr: np.ndarray, length: int) -> np.ndarray:
