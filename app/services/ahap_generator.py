@@ -97,8 +97,8 @@ def generate_ahap(
         ]
 
         # ── Slice envelope for this chunk ────────────────
-        env_start_idx = int(chunk_start * env_fps)
-        env_end_idx = int(chunk_end * env_fps)
+        env_start_idx = round(chunk_start * env_fps)
+        env_end_idx = round(chunk_end * env_fps)
         chunk_intensity = intensity_env[env_start_idx:env_end_idx] if intensity_env else []
         chunk_sharpness = sharpness_env[env_start_idx:env_end_idx] if sharpness_env else []
 
@@ -267,6 +267,15 @@ def _build_pattern(
             pattern_entries.append(sharpness_curve)
 
     # ── 4. Transient accent taps ─────────────────────────
+    # Enforce Apple's per-chunk event limit.
+    # The HapticContinuous carrier counts as 1, so transients
+    # get (MAX - 1) slots.  Keep the highest-intensity ones.
+    max_transients = settings.MAX_AHAP_EVENTS_PER_CHUNK - 1  # reserve 1 for carrier
+    if len(transient_events) > max_transients:
+        # Sort by intensity descending, keep top-N, re-sort by time
+        transient_events = sorted(transient_events, key=lambda e: e.intensity, reverse=True)[:max_transients]
+        transient_events = sorted(transient_events, key=lambda e: e.time)
+
     for event in transient_events:
         rel_time = round(max(0.0, event.time - chunk_start), 4)
         pattern_entries.append(_make_transient(

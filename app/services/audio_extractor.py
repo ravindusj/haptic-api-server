@@ -21,7 +21,7 @@ def extract_audio(
     Extract audio from a video file, producing two WAV files:
 
     1. ``{job_id}_22050.wav`` – 22 050 Hz mono (for librosa DSP analysis)
-    2. ``{job_id}_32000.wav`` – 32 000 Hz mono (for PANNs AI inference)
+    2. ``{job_id}_16000.wav`` – 16 000 Hz mono (for YAMNet + Whisper)
 
     Parameters
     ----------
@@ -32,7 +32,7 @@ def extract_audio(
 
     Returns
     -------
-    dict with keys ``"librosa_wav"`` and ``"panns_wav"`` pointing to
+    dict with keys ``"librosa_wav"`` and ``"classifier_wav"`` pointing to
     the output file paths, plus ``"duration"`` in seconds.
     """
     video_path = Path(video_path)
@@ -43,7 +43,7 @@ def extract_audio(
     os.makedirs(work_dir, exist_ok=True)
 
     librosa_wav = str(work_dir / f"{job_id}_22050.wav")
-    panns_wav = str(work_dir / f"{job_id}_32000.wav")
+    classifier_wav = str(work_dir / f"{job_id}_16000.wav")
 
     # ── Get video duration ───────────────────────────────
     duration = _get_duration(str(video_path))
@@ -52,12 +52,12 @@ def extract_audio(
     # ── Extract at 22050 Hz (librosa) ────────────────────
     _ffmpeg_extract(str(video_path), librosa_wav, sample_rate=settings.AUDIO_SAMPLE_RATE)
 
-    # ── Extract at 32000 Hz (PANNs) ─────────────────────
-    _ffmpeg_extract(str(video_path), panns_wav, sample_rate=settings.PANNS_SAMPLE_RATE)
+    # ── Extract at 16000 Hz (YAMNet + Whisper) ──────────
+    _ffmpeg_extract(str(video_path), classifier_wav, sample_rate=settings.CLASSIFIER_SAMPLE_RATE)
 
     return {
         "librosa_wav": librosa_wav,
-        "panns_wav": panns_wav,
+        "classifier_wav": classifier_wav,
         "duration": duration,
     }
 

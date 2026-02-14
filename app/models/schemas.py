@@ -100,12 +100,28 @@ class DSPFeatures(BaseModel):
     total_frames: int
     duration_seconds: float
 
-    # Per-frame arrays (serialised as lists for Celery/Redis)
-    rms_energy: list[float]
-    onset_strength: list[float]
-    low_freq_energy: list[float]       # 20-200 Hz band energy
+    # ── HPSS-separated signals ───────────────────────────
+    harmonic_rms: list[float]          # RMS of harmonic component
+    percussive_rms: list[float]        # RMS of percussive component
+    percussive_onset: list[float]      # onset strength of percussive only
+
+    # ── Full-mix features ────────────────────────────────
+    rms_energy: list[float]            # overall RMS (normalised)
     spectral_centroid: list[float]     # normalised 0-1
     spectral_flux: list[float]
+
+    # ── Multi-band frequency energies (normalised) ───────
+    sub_bass_energy: list[float]       # 20-60 Hz
+    bass_energy: list[float]           # 60-250 Hz
+    low_mid_energy: list[float]        # 250-500 Hz
+    mid_energy: list[float]            # 500-2000 Hz
+    presence_energy: list[float]       # 2000-4000 Hz
+    brilliance_energy: list[float]     # 4000-8000 Hz
+
+    # Raw (pre-normalisation) RMS for absolute-loudness awareness
+    raw_rms_mean: float = 0.0
+    raw_rms_peak: float = 0.0
+    raw_rms_array: list[float] = []
 
     # Beat positions (in seconds)
     beat_times: list[float]
@@ -113,6 +129,14 @@ class DSPFeatures(BaseModel):
 
     class Config:
         arbitrary_types_allowed = True
+
+
+class SpeechSegment(BaseModel):
+    """A contiguous speech segment detected by Whisper."""
+
+    start: float    # seconds
+    end: float      # seconds
+    confidence: float = 1.0  # 0-1
 
 
 class AIClassification(BaseModel):
@@ -124,6 +148,9 @@ class AIClassification(BaseModel):
     haptic_scores: list[float]         # 0-1, how haptic-worthy
     speech_scores: list[float]         # 0-1, speech probability
     dominant_classes: list[str]        # top class label per frame
+
+    # Whisper-detected speech segments (precise timestamps)
+    speech_segments: list[SpeechSegment] = []
 
 
 class HapticEvent(BaseModel):

@@ -1,11 +1,14 @@
 """DSP-based audio feature extraction using librosa.
 
-Extracts frame-level features that map to haptic characteristics:
-- RMS energy → overall loudness / intensity
-- Onset strength → percussive transients (impacts, hits)
-- Low-frequency energy (20-200 Hz) → bass rumble
-- Spectral centroid → brightness → haptic sharpness
-- Spectral flux → timbral change rate
+Uses Harmonic-Percussive Source Separation (HPSS) and multi-band
+frequency decomposition for rich haptic feature extraction:
+
+- HPSS → separates audio into harmonic (sustained) and percussive
+  (transient) components for cleaner signal routing
+- Percussive RMS + onset → drives transient tap events
+- Harmonic RMS → drives the continuous envelope
+- 6-band frequency energies → intensity/sharpness mapping
+- Spectral centroid/flux → tonal character
 - Beat positions → rhythmic pulse points
 """
 
@@ -36,7 +39,7 @@ def analyze_dsp(wav_path: str) -> DSPFeatures:
     Returns
     -------
     DSPFeatures
-        Frame-level arrays + beat positions.
+        HPSS-separated signals, multi-band energies, and beat positions.
     """
     sr = settings.AUDIO_SAMPLE_RATE
     hop = settings.HOP_LENGTH
@@ -46,44 +49,69 @@ def analyze_dsp(wav_path: str) -> DSPFeatures:
     duration = librosa.get_duration(y=y, sr=sr)
     logger.info("Audio loaded: %.2fs, %d samples", duration, len(y))
 
-    # ── RMS Energy ───────────────────────────────────────
+    # ── HPSS: Harmonic–Percussive Source Separation ──────
+    # margin=3.0 gives a clean 3-way split: harmonic, percussive, residual.
+    # Percussive → impacts, drums, transients
+    # Harmonic   → sustained tones, melody, voice
+    # Residual   → noise, ambience (discarded for haptics)
+    D = librosa.stft(y, hop_length=hop)
+    H, P = librosa.decompose.hpss(D, margin=3.0)
+    y_harmonic = librosa.istft(H, hop_length=hop, length=len(y))
+    y_percussive = librosa.istft(P, hop_length=hop, length=len(y))
+
+    harmonic_rms = librosa.feature.rms(y=y_harmonic, hop_length=hop)[0]
+    percussive_rms = librosa.feature.rms(y=y_percussive, hop_length=hop)[0]
+
+    # Onset strength from percussive component only — no false
+    # triggers on speech syllables or sustained instrument notes.
+    percussive_onset = librosa.onset.onset_strength(
+        y=y_percussive, sr=sr, hop_length=hop,
+    )
+
+    # ── Overall RMS ──────────────────────────────────────
     rms = librosa.feature.rms(y=y, hop_length=hop)[0]
-    rms_norm = _normalise(rms)
+    raw_rms_mean = float(np.mean(rms))
+    raw_rms_peak = float(np.percentile(rms, 98)) if len(rms) > 0 else 0.0
 
-    # ── Onset Strength ───────────────────────────────────
-    onset_env = librosa.onset.onset_strength(y=y, sr=sr, hop_length=hop)
-    onset_norm = _normalise(onset_env)
+    # ── 6-Band Frequency Decomposition ───────────────────
+    bands = settings.FREQ_BANDS
+    band_energies: dict[str, np.ndarray] = {}
+    for name, (lo, hi) in bands.items():
+        band_energies[name] = _bandpass_energy(y, sr, lo, hi, hop)
 
-    # ── Low-Frequency Energy (20-200 Hz band) ───────────
-    low_freq = _bandpass_energy(y, sr, low=20, high=200, hop_length=hop)
-    low_freq_norm = _normalise(low_freq)
-
-    # ── Spectral Centroid → Sharpness mapping ───────────
+    # ── Spectral Centroid → sharpness mapping ────────────
     centroid = librosa.feature.spectral_centroid(y=y, sr=sr, hop_length=hop)[0]
-    # Normalise relative to Nyquist, but use a practical max of ~8 kHz
-    # (most haptic-relevant energy is below that)
     practical_max = min(8000.0, sr / 2.0)
     centroid_norm = np.clip(centroid / practical_max, 0.0, 1.0)
 
-    # ── Spectral Flux ───────────────────────────────────
-    spec = np.abs(librosa.stft(y, hop_length=hop))
+    # ── Spectral Flux ────────────────────────────────────
+    spec = np.abs(D)
     flux = np.sqrt(np.mean(np.diff(spec, axis=1) ** 2, axis=0))
-    # Pad to match frame count
     flux = np.concatenate([[0.0], flux])
-    flux_norm = _normalise(flux)
 
     # ── Beat Tracking ────────────────────────────────────
-    beat_times, beat_strengths = _detect_beats(y, sr, hop)
+    beat_times, beat_strengths = _detect_beats(y_percussive, sr, hop)
 
-    # Ensure all arrays have the same length
-    n_frames = len(rms_norm)
-    onset_norm = _pad_or_trim(onset_norm, n_frames)
-    low_freq_norm = _pad_or_trim(low_freq_norm, n_frames)
+    # ── Normalise all arrays ─────────────────────────────
+    n_frames = len(rms)
+    rms_norm = _normalise(rms)
+    harmonic_norm = _normalise(harmonic_rms)
+    percussive_norm = _normalise(percussive_rms)
+    onset_norm = _normalise(percussive_onset)
     centroid_norm = _pad_or_trim(centroid_norm, n_frames)
-    flux_norm = _pad_or_trim(flux_norm, n_frames)
+    flux_norm = _normalise(_pad_or_trim(flux, n_frames))
+
+    band_norms: dict[str, np.ndarray] = {}
+    for name, raw in band_energies.items():
+        band_norms[name] = _normalise(_pad_or_trim(raw, n_frames))
+
+    # Trim/pad HPSS arrays
+    harmonic_norm = _pad_or_trim(harmonic_norm, n_frames)
+    percussive_norm = _pad_or_trim(percussive_norm, n_frames)
+    onset_norm = _pad_or_trim(onset_norm, n_frames)
 
     logger.info(
-        "DSP analysis complete: %d frames, %d beats detected",
+        "DSP analysis complete: %d frames, %d beats, HPSS + 6-band",
         n_frames,
         len(beat_times),
     )
@@ -93,11 +121,26 @@ def analyze_dsp(wav_path: str) -> DSPFeatures:
         hop_length=hop,
         total_frames=n_frames,
         duration_seconds=round(duration, 4),
+        # HPSS signals
+        harmonic_rms=harmonic_norm.tolist(),
+        percussive_rms=percussive_norm.tolist(),
+        percussive_onset=onset_norm.tolist(),
+        # Full-mix
         rms_energy=rms_norm.tolist(),
-        onset_strength=onset_norm.tolist(),
-        low_freq_energy=low_freq_norm.tolist(),
         spectral_centroid=centroid_norm.tolist(),
         spectral_flux=flux_norm.tolist(),
+        # Multi-band
+        sub_bass_energy=band_norms["sub_bass"].tolist(),
+        bass_energy=band_norms["bass"].tolist(),
+        low_mid_energy=band_norms["low_mid"].tolist(),
+        mid_energy=band_norms["mid"].tolist(),
+        presence_energy=band_norms["presence"].tolist(),
+        brilliance_energy=band_norms["brilliance"].tolist(),
+        # Raw RMS
+        raw_rms_mean=round(raw_rms_mean, 6),
+        raw_rms_peak=round(raw_rms_peak, 6),
+        raw_rms_array=rms.tolist(),
+        # Beats
         beat_times=[round(float(t), 4) for t in beat_times],
         beat_strengths=[round(float(s), 4) for s in beat_strengths],
     )

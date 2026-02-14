@@ -32,21 +32,34 @@ class Settings(BaseSettings):
 
     # ── Audio Analysis ───────────────────────────────────
     AUDIO_SAMPLE_RATE: int = 22050        # librosa default
-    PANNS_SAMPLE_RATE: int = 32000        # PANNs CNN14 expects 32 kHz
+    CLASSIFIER_SAMPLE_RATE: int = 16000   # YAMNet & Whisper expect 16 kHz
     HOP_LENGTH: int = 512                 # ~23 ms at 22050 Hz
     FRAME_DURATION_MS: float = 23.2       # hop_length / sr * 1000
 
     # ── Haptic Generation ────────────────────────────────
     DEFAULT_SENSITIVITY: float = 0.5      # 0-1, controls threshold
     MIN_TRANSIENT_INTERVAL_MS: float = 50 # debounce between taps
-    SILENCE_RMS_THRESHOLD: float = 0.01   # below = silence
+    SILENCE_RMS_THRESHOLD: float = 0.01   # below = silence (raw RMS)
     SPEECH_SUPPRESSION_FACTOR: float = 0.05  # near-zero for dialogue
     MAX_AHAP_EVENTS_PER_CHUNK: int = 128  # Apple limit per pattern
     AHAP_CHUNK_DURATION_S: float = 30.0   # Apple limit per pattern
 
-    # ── PANNs Model ──────────────────────────────────────
-    PANNS_MODEL_NAME: str = "Cnn14_mAP=0.431.pth"
-    PANNS_CHECKPOINT_PATH: str | None = None  # auto-downloaded if None
+    # ── YAMNet Model ─────────────────────────────────────
+    YAMNET_MODEL_HANDLE: str = "https://tfhub.dev/google/yamnet/1"
+
+    # ── Whisper Model ────────────────────────────────────
+    WHISPER_MODEL_SIZE: str = "tiny"      # tiny | base | small
+    WHISPER_COMPUTE_TYPE: str = "int8"    # int8 for CPU efficiency
+
+    # ── Frequency Bands (Hz) ─────────────────────────────
+    FREQ_BANDS: dict[str, tuple[int, int]] = {
+        "sub_bass":   (20, 60),
+        "bass":       (60, 250),
+        "low_mid":    (250, 500),
+        "mid":        (500, 2000),
+        "presence":   (2000, 4000),
+        "brilliance": (4000, 8000),
+    }
 
     # ── AWS (optional, for S3 storage) ───────────────────
     AWS_ACCESS_KEY_ID: str | None = None

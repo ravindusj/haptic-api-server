@@ -16,10 +16,11 @@ numpy==1.26.4
 scipy==1.14.1
 
 # ── AI Sound Event Detection ────────────────────────────
-panns-inference==0.1.1
-torch==2.5.1
-torchvision==0.20.1
-torchaudio==2.5.1
+tensorflow>=2.15.0,<2.18
+tensorflow-hub>=0.16.1
+
+# ── Speech Detection (Whisper via CTranslate2, no PyTorch) ──
+faster-whisper>=1.0.0
 
 # ── Utilities ────────────────────────────────────────────
 python-dotenv==1.0.1

@@ -92,7 +92,7 @@ def analyze_video_task(
     This is the main Celery task that runs the entire pipeline:
     1. Extract audio from video (FFmpeg)
     2. DSP feature extraction (librosa)
-    3. AI sound event classification (PANNs CNN14)
+    3. AI sound event classification (YAMNet + Whisper)
     4. Haptic score fusion (DSP + AI)
     5. AHAP file generation
 
@@ -139,7 +139,7 @@ def analyze_video_task(
         logger.info("[%s] Step 3/5: AI classification…", job_id)
 
         from app.services.ai_classifier import classify_audio
-        ai_result = classify_audio(audio_result["panns_wav"])
+        ai_result = classify_audio(audio_result["classifier_wav"])
 
         _set_job_status(job_id, "classifying_ai", progress=70.0)
 
