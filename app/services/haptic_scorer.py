@@ -52,13 +52,13 @@ class ScoringWeights:
     meaningful sounds identified by YAMNet.
     """
 
-    percussive: float = 0.30   # HPSS percussive RMS
-    sub_bass: float = 0.15     # 20-60 Hz deep rumble
-    bass: float = 0.15         # 60-250 Hz punch
+    percussive: float = 0.25   # HPSS percussive RMS
+    sub_bass: float = 0.20     # 20-60 Hz deep rumble
+    bass: float = 0.20         # 60-250 Hz punch
     low_mid: float = 0.05      # 250-500 Hz body
     mid: float = 0.05          # 500-2000 Hz texture
     presence: float = 0.05     # 2000-4000 Hz detail
-    ai: float = 0.25           # YAMNet haptic score
+    ai: float = 0.20           # YAMNet haptic score
 
 
 # ── Public API ───────────────────────────────────────────
@@ -118,17 +118,22 @@ def fuse_scores(
 
     # ── Percussive novelty gating ────────────────────────
     # Constant percussive energy (machine hum, engine) → suppress.
-    # Genuine impacts are transient by nature.
+    # Floor raised to 0.50 so steady rhythms (drums, bass lines)
+    # retain at least half their energy instead of being killed.
     novelty_win = max(3, int(0.5 / frame_dur))
     perc_nov = _rolling_std(perc_rms, novelty_win)
     perc_nmax = np.percentile(perc_nov, 98) if len(perc_nov) > 0 else 1.0
     if perc_nmax > 1e-6:
         perc_nov /= perc_nmax
     perc_nov = np.clip(perc_nov, 0.0, 1.0)
-    perc_gate = 0.20 + 0.80 * perc_nov
+    perc_gate = 0.50 + 0.50 * perc_nov
     perc_modulated = perc_rms * perc_gate
 
     # ── Combine weighted signals ─────────────────────────
+    # Include harmonic RMS so sustained music (strings, pads,
+    # singing) drives continuous vibration — not just transients.
+    harmonic_contribution = 0.15 * harm_rms
+
     combined = (
         weights.percussive * perc_modulated
         + weights.sub_bass * sub_bass
@@ -137,6 +142,7 @@ def fuse_scores(
         + weights.mid * mid
         + weights.presence * presence
         + weights.ai * ai_haptic
+        + harmonic_contribution
     )
 
     # ── Impact amplification ─────────────────────────────
@@ -159,7 +165,7 @@ def fuse_scores(
 
     # ── Clamp & comfort ceiling ──────────────────────────
     combined = np.clip(combined, 0.0, 1.0)
-    envelope_signal = np.clip(combined, 0.0, 0.85)
+    envelope_signal = np.clip(combined, 0.0, 0.95)
 
     # ── Adaptive rest gate — zero out faint frames ───────
     # Use a low fixed floor plus a fraction of the local median
@@ -167,6 +173,17 @@ def fuse_scores(
     local_median = np.median(envelope_signal[envelope_signal > 0]) if np.any(envelope_signal > 0) else 0.0
     rest_threshold = max(0.015, 0.08 * local_median)
     envelope_signal[envelope_signal < rest_threshold] = 0.0
+
+    # ── Perceptual floor boost ───────────────────────────
+    # Remap non-silent frames from [0, 1] to [0.20, 1.0] so
+    # any audible content produces at least a perceptible
+    # vibration on the Taptic Engine (values < 0.2 are barely felt).
+    envelope_signal = np.where(
+        envelope_signal > 0.01,
+        0.20 + envelope_signal * 0.80,
+        0.0,
+    )
+    envelope_signal = np.clip(envelope_signal, 0.0, 1.0)
 
     # ── Build sharpness from band balance ────────────────
     # Sub-bass heavy → low sharpness, presence/brilliance → high.

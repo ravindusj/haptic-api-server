@@ -61,17 +61,41 @@ HAPTIC_WORTHY_CLASSES: dict[int, str] = {
     166: "Drum kit",
     # Bass & low-freq instruments
     153: "Bass guitar",
+    # Guitar / strings
+    135: "Guitar",
+    136: "Electric guitar",
+    137: "Acoustic guitar",
+    147: "Violin, fiddle",
+    148: "Cello",
+    149: "Double bass",
+    150: "Harp",
+    151: "Mandolin",
+    152: "Banjo",
+    154: "Ukulele",
+    # Keyboard instruments
+    141: "Piano",
+    142: "Electric piano",
+    143: "Keyboard (musical)",
+    144: "Organ",
+    145: "Synthesizer",
+    # Vocal (musical — not speech)
+    24: "Singing",
     # Engine & machinery
     337: "Engine",
     338: "Motor vehicle (road)",
     340: "Car",
     346: "Motorcycle",
     348: "Truck",
-    # Music categories (impactful)
+    # Music categories
     489: "Heavy metal",
     490: "Punk rock",
+    486: "Rock music",
+    487: "Pop music",
+    488: "Hip hop music",
+    491: "Disco",
+    492: "Electronic music",
+    493: "Techno",
     132: "Music",
-    135: "Guitar",
     # Other impacts
     455: "Knock",
     456: "Tap",
@@ -87,7 +111,6 @@ SPEECH_CLASSES: dict[int, str] = {
     6: "Babbling",
     7: "Speech synthesizer",
     10: "Whispering",
-    24: "Singing",
 }
 
 NON_WORTHY_CLASSES: dict[int, str] = {
