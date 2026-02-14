@@ -41,13 +41,14 @@ ENVELOPE_FPS: float = 20.0
 class ScoringWeights:
     """Relative importance of each signal source.
 
-    RMS is dominant (0.45) so the base vibration directly tracks
-    audio loudness — this is what Sony DVS does.
+    Onset is the dominant action signal (0.30) — it
+    represents percussive impacts, hits, and musical beats.
+    Bass rumble and RMS track overall energy.
     """
 
-    rms: float = 0.45
-    onset: float = 0.20
-    bass: float = 0.20
+    rms: float = 0.30
+    onset: float = 0.30
+    bass: float = 0.25
     ai: float = 0.15
 
 
@@ -95,60 +96,130 @@ def fuse_scores(
     ai_haptic = _resample_to_length(np.array(ai.haptic_scores), n_frames)
     ai_speech = _resample_to_length(np.array(ai.speech_scores), n_frames)
 
+    # ── DSP-based speech detection ───────────────────────
+    # PANNs may be unavailable (fallback mode → speech=0.0).
+    # Use spectral features to detect dialogue:
+    #   • speech centroid ≈ 0.04-0.40 (300-3200 Hz / 8 kHz)
+    #   • low bass (< 0.25)  — explosions have high bass
+    #   • low onset (< 0.25) — impacts are percussive
+    #   • moderate RMS (> 0.05) — not silence
+    # When all true → likely dialogue → suppress.
+    dsp_speech = _detect_speech_dsp(rms, onset, bass, centroid)
+
+    # Merge: take the stronger of AI and DSP speech scores
+    speech_score = np.maximum(ai_speech, dsp_speech)
+
     # ── Compute combined haptic score per frame ──────────
+    # Novelty modulation: RMS and bass are suppressed when
+    # constant (steady drone, background hum → fatiguing).
+    # Onset passes through unmodified — it inherently measures
+    # *change* in the audio so it's already a novelty signal.
+    novelty_window = max(3, int(0.5 / frame_dur))   # ~22 frames
+
+    # RMS novelty
+    rms_nov = _rolling_std(rms, novelty_window)
+    rms_nmax = np.percentile(rms_nov, 98) if len(rms_nov) > 0 else 1.0
+    if rms_nmax > 1e-6:
+        rms_nov = rms_nov / rms_nmax
+    rms_nov = np.clip(rms_nov, 0.0, 1.0)
+    rms_gate = 0.15 + 0.85 * rms_nov   # constant → 0.15, dynamic → 1.0
+    rms_modulated = rms * rms_gate
+
     combined = (
-        weights.rms * rms
-        + weights.onset * onset
-        + weights.bass * bass
+        weights.rms * rms_modulated
+        + weights.onset * onset       # onset is inherently transient
+        + weights.bass * bass         # bass rumble passes through
         + weights.ai * ai_haptic
     )
 
-    # ── Apply gentle power curve ─────────────────────────
-    # Expand mid-range values upward so quiet-but-audible audio
-    # still produces a perceptible vibration.  Using 0.7 instead
-    # of 0.6 preserves more dynamic range.
-    combined = np.power(np.clip(combined, 0.0, None), 0.7)
+    # ── Impact amplification ─────────────────────────────
+    # When bass AND onset are BOTH strong, this is a genuine
+    # impact (explosion, drum hit, crash).  Amplify so these
+    # moments feel physically powerful.  Requires high onset
+    # to avoid boosting constant bass scenes.
+    impact_factor = np.where(
+        (bass > 0.30) & (onset > 0.30),
+        1.0 + 0.7 * bass * onset,   # up to ~1.7× for heavy hits
+        1.0,
+    )
+    combined = combined * impact_factor
 
-    # ── Speech suppression (softer than before: ×0.3) ────
-    speech_gate = np.where(ai_speech > 0.4, 0.30, 1.0)
+    # ── Speech suppression (hard: ×0.0 for dialogue) ─────
+    # During speech, completely zero out the vibration.
+    # Guard frames extend the zone by ~150 ms on each side
+    # so boundary taps don't fire at dialogue edges.
+    guard_frames = max(1, int(0.15 / frame_dur))  # ~7 frames
+    speech_binary = (speech_score > 0.5).astype(np.float64)
+    # Dilate: extend speech regions by guard_frames in each direction
+    dilated = speech_binary.copy()
+    for offset in range(1, guard_frames + 1):
+        dilated[offset:] = np.maximum(dilated[offset:], speech_binary[:-offset])
+        dilated[:-offset] = np.maximum(dilated[:-offset], speech_binary[offset:])
+    speech_gate = np.where(dilated > 0.5, 0.0, 1.0)
+    # Smooth the gate over ~80 ms for a natural crossfade
+    gate_smooth = max(1, int(0.08 / frame_dur))
+    speech_gate = _smooth(speech_gate, gate_smooth)
+    # Hard floor: ensure near-zero values are fully zeroed
+    speech_gate = np.where(speech_gate < 0.15, 0.0, speech_gate)
     combined *= speech_gate
 
     # ── Silence gate with soft fade ──────────────────────
     silence_mask = rms < settings.SILENCE_RMS_THRESHOLD
-    # Apply a 3-frame (~70 ms) fade at silence boundaries
-    # instead of hard zero to avoid jarring on/off.
     fade_frames = 3
     combined = _apply_silence_fade(combined, silence_mask, fade_frames)
 
-    # ── Light smoothing (50 ms) ──────────────────────────
-    smooth_win = max(1, int(0.05 / frame_dur))
-    combined = _smooth(combined, smooth_win)
+    # ── Re-apply speech & silence gates ──────────────────
+    # The silence fade affects boundary frames.  Re-apply
+    # speech gate to keep dialogue zones perfectly clean.
+    combined *= speech_gate
+    combined = _apply_silence_fade(combined, silence_mask, fade_frames)
+
+    # ── Clamp to [0, 1] ─────────────────────────────────
+    combined = np.clip(combined, 0.0, 1.0)
+
+    # ── Direct mapping (no power curve) ───────────────────
+    # The novelty modulation and speech gating already provide
+    # dynamic range.  Use the combined signal directly so
+    # action scenes retain full punch.
+    envelope_signal = combined.copy()
+
+    # ── Comfort ceiling ──────────────────────────────────
+    # Cap at 0.85 so the loudest moments feel strong but not
+    # jarring.  Transient taps can still hit 1.0.
+    envelope_signal = np.clip(envelope_signal, 0.0, 0.85)
+
+    # ── Rest gate ────────────────────────────────────────
+    # Zero out frames below a minimum energy so the user gets
+    # intentional rest periods.  After x^1.2, raw 0.10 → 0.06.
+    rest_threshold = 0.05
+    envelope_signal[envelope_signal < rest_threshold] = 0.0
 
     # ── Build sharpness signal (bass → low, treble → high) ─
     sharpness = centroid.copy()
-    # Where bass energy is strong, push sharpness down for a
-    # deeper "rumble" feel.
     bass_heavy = bass > 0.3
     sharpness[bass_heavy] = np.clip(sharpness[bass_heavy] * 0.4, 0.05, 0.95)
     sharpness = np.clip(sharpness, 0.05, 0.95)
-    sharpness = _smooth(sharpness, smooth_win)
-
-    # ── Boost combined into perceptible range [0.25, 1.0] ─
-    # Apple Taptic Engine barely feels values under ~0.3.
-    boosted = _boost_array(combined)
+    sharpness_smooth_win = max(1, int(0.05 / frame_dur))
+    sharpness = _smooth(sharpness, sharpness_smooth_win)
 
     # ── Downsample to envelope rate (~20 fps) ────────────
-    intensity_env = _downsample_max(boosted, frame_dur, ENVELOPE_FPS)
+    intensity_env = _downsample_max(envelope_signal, frame_dur, ENVELOPE_FPS)
     sharpness_env = _downsample_mean(sharpness, frame_dur, ENVELOPE_FPS)
 
+    # ── Boost only for transient event detection ─────────
+    # Transient taps need to punch through, so we boost them.
+    boosted_for_taps = _boost_array(combined)
+
+    # ── Suppress transients during speech too ────────────
+    # Apply the same speech gate so no taps fire during dialogue.
+    boosted_for_taps *= speech_gate
+
     # ── Extract transient tap events ─────────────────────
-    # Threshold only affects which onset spikes get a tap —
-    # the continuous envelope is always emitted for non-silent audio.
     threshold = 0.45 - (sensitivity * 0.40)
     threshold = max(0.05, threshold)
 
     events = _extract_transient_events(
-        combined=boosted,
+        combined=boosted_for_taps,
         onset=onset,
         centroid=centroid,
         bass=bass,
@@ -157,6 +228,7 @@ def fuse_scores(
         hop=dsp.hop_length,
         beat_times=dsp.beat_times,
         beat_strengths=dsp.beat_strengths,
+        speech_gate=speech_gate,
     )
 
     logger.info(
@@ -182,7 +254,7 @@ def fuse_scores(
             "total_frames": n_frames,
             "envelope_points": len(intensity_env),
             "speech_suppressed_pct": round(
-                float(np.mean(ai_speech > 0.4)) * 100, 1
+                float(np.mean(speech_score > 0.5)) * 100, 1
             ),
         },
     )
@@ -201,6 +273,7 @@ def _extract_transient_events(
     hop: int,
     beat_times: list[float],
     beat_strengths: list[float],
+    speech_gate: np.ndarray | None = None,
 ) -> list[HapticEvent]:
     """Extract transient (tap) events only.
 
@@ -220,6 +293,9 @@ def _extract_transient_events(
         if combined[fi] < threshold * 0.5:
             continue
         if onset[fi] < onset_gate:
+            continue
+        # Skip if in a speech-suppressed region
+        if speech_gate is not None and fi < len(speech_gate) and speech_gate[fi] < 0.1:
             continue
         t = fi * frame_dur
         if (t - last_t) < min_interval:
@@ -245,6 +321,11 @@ def _extract_transient_events(
     for bt, bs in zip(beat_times, beat_strengths):
         if bs < 0.12:
             continue
+        # Skip beats that land during speech/dialogue
+        if speech_gate is not None:
+            beat_frame = int(bt / frame_dur)
+            if beat_frame < len(speech_gate) and speech_gate[beat_frame] < 0.1:
+                continue
         too_close = any(
             abs(e.time - bt) < min_interval
             for e in events
@@ -352,3 +433,63 @@ def _smooth(arr: np.ndarray, window: int) -> np.ndarray:
         return arr
     kernel = np.ones(window) / window
     return np.convolve(arr, kernel, mode="same")
+
+
+def _rolling_std(arr: np.ndarray, window: int) -> np.ndarray:
+    """Compute rolling standard deviation (measures local variation)."""
+    if window <= 1 or len(arr) < 2:
+        return np.ones_like(arr)
+    n = len(arr)
+    out = np.empty(n)
+    half = window // 2
+    for i in range(n):
+        lo = max(0, i - half)
+        hi = min(n, i + half + 1)
+        out[i] = np.std(arr[lo:hi])
+    return out
+
+
+def _detect_speech_dsp(
+    rms: np.ndarray,
+    onset: np.ndarray,
+    bass: np.ndarray,
+    centroid: np.ndarray,
+) -> np.ndarray:
+    """Heuristic speech detection from DSP features alone.
+
+    Speech has a recognisable spectral fingerprint compared to
+    action/effects/music:
+      • Centroid in the vocal range (~300–3200 Hz → 0.04–0.40
+        normalised against 8 kHz practical max)
+      • Low bass energy (voice lacks sub-bass unlike explosions)
+      • Low onset strength (speech is not percussive)
+      • Moderate-to-high RMS (not silence)
+
+    Returns a per-frame speech probability in [0, 1].
+    """
+    n = len(rms)
+    speech = np.zeros(n, dtype=np.float64)
+
+    # Conditions (all must be loosely true)
+    in_vocal_range = (centroid >= 0.03) & (centroid <= 0.45)
+    low_bass = bass < 0.25
+    low_onset = onset < 0.25
+    has_energy = rms > 0.05
+
+    # Score: fraction of conditions met → soft probability
+    cond_sum = (
+        in_vocal_range.astype(np.float64)
+        + low_bass.astype(np.float64)
+        + low_onset.astype(np.float64)
+        + has_energy.astype(np.float64)
+    )
+    # All 4 met → 1.0;  3 met → 0.6;  ≤2 → 0
+    speech = np.where(cond_sum >= 4, 1.0, np.where(cond_sum >= 3, 0.6, 0.0))
+
+    # Temporal smoothing (~300 ms) to avoid flickering
+    if n > 1:
+        kernel_size = max(1, int(0.3 * 43))  # ~13 frames at 43fps
+        speech = _smooth(speech, kernel_size)
+        speech = np.clip(speech, 0.0, 1.0)
+
+    return speech
