@@ -23,6 +23,7 @@ class AnalysisStyle(str, enum.Enum):
 class JobStatus(str, enum.Enum):
     QUEUED = "queued"
     EXTRACTING_AUDIO = "extracting_audio"
+    ANALYZING_VIDEO = "analyzing_video"
     ANALYZING_DSP = "analyzing_dsp"
     CLASSIFYING_AI = "classifying_ai"
     SCORING = "scoring"
@@ -161,6 +162,34 @@ class HapticEvent(BaseModel):
     duration: float = 0.0             # only for continuous events
     intensity: float = 0.0            # 0-1
     sharpness: float = 0.5            # 0-1
+
+
+class SceneChange(BaseModel):
+    """A detected scene cut with timestamp and magnitude."""
+
+    time: float                        # seconds from start
+    magnitude: float                   # d/threshold ratio (1.0=barely, 5.0+=hard cut)
+
+
+class VideoFeatures(BaseModel):
+    """Frame-level video motion and action recognition features.
+
+    Produced by the video_analyzer service.  Motion intensity
+    comes from optical flow; action scores from MoViNet-A0.
+    """
+
+    fps: float                         # analysis sample rate
+    total_frames: int
+    duration_seconds: float
+
+    # Tier 1: Optical flow
+    motion_intensity: list[float]      # 0-1 per analysis frame
+    scene_changes: list[SceneChange]   # scene cuts with time + magnitude
+
+    # Tier 2: MoViNet action recognition
+    action_scores: dict[str, list[float]]  # category → per-window scores
+    dominant_actions: list[str]        # dominant category per window
+    action_window_duration_s: float    # seconds per classification window
 
 
 class HapticTimeline(BaseModel):

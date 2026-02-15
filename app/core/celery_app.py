@@ -1,6 +1,6 @@
 """Celery application and async task definitions.
 
-Pipeline: extract_audio → analyze_dsp → classify_ai → fuse_scores → generate_ahap
+Pipeline: extract_audio → [analyze_dsp + analyze_video] → classify_ai → fuse_scores → generate_ahap
 """
 
 from __future__ import annotations
@@ -114,7 +114,7 @@ def analyze_video_task(
     try:
         # ── Step 1: Extract audio ────────────────────────
         _set_job_status(job_id, "extracting_audio", progress=5.0)
-        logger.info("[%s] Step 1/5: Extracting audio…", job_id)
+        logger.info("[%s] Step 1/6: Extracting audio…", job_id)
 
         from app.services.audio_extractor import extract_audio
         audio_result = extract_audio(video_path, job_id)
@@ -125,18 +125,49 @@ def analyze_video_task(
             duration=duration,
         )
 
-        # ── Step 2: DSP Analysis ─────────────────────────
+        # ── Step 2: DSP + Video Analysis (parallel) ──────
         _set_job_status(job_id, "analyzing_dsp", progress=25.0)
-        logger.info("[%s] Step 2/5: DSP analysis…", job_id)
+        logger.info("[%s] Step 2/6: DSP + Video analysis (parallel)…", job_id)
 
+        from concurrent.futures import ThreadPoolExecutor, as_completed
         from app.services.dsp_analyzer import analyze_dsp
-        dsp_features = analyze_dsp(audio_result["librosa_wav"])
+        from app.services.video_analyzer import analyze_video
 
-        _set_job_status(job_id, "analyzing_dsp", progress=45.0)
+        video_features = None
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            dsp_future = pool.submit(analyze_dsp, audio_result["librosa_wav"])
+            vid_future = pool.submit(analyze_video, video_path)
+
+            for future in as_completed([dsp_future, vid_future]):
+                if future is dsp_future:
+                    dsp_features = future.result()
+                    _set_job_status(job_id, "analyzing_dsp", progress=40.0)
+                    logger.info("[%s] DSP analysis done", job_id)
+                else:
+                    try:
+                        video_features = future.result()
+                        _set_job_status(
+                            job_id, "analyzing_video", progress=45.0,
+                        )
+                        logger.info(
+                            "[%s] Video analysis done – dominant: %s",
+                            job_id,
+                            video_features.dominant_actions[:3]
+                            if video_features else "none",
+                        )
+                    except Exception as ve:
+                        logger.warning(
+                            "[%s] Video analysis failed (non-fatal): %s",
+                            job_id, ve,
+                        )
+                        video_features = None
+
+        _set_job_status(job_id, "analyzing_dsp", progress=48.0)
 
         # ── Step 3: AI Classification ────────────────────
         _set_job_status(job_id, "classifying_ai", progress=50.0)
-        logger.info("[%s] Step 3/5: AI classification…", job_id)
+        logger.info("[%s] Step 3/6: AI classification…", job_id)
 
         from app.services.ai_classifier import classify_audio
         ai_result = classify_audio(audio_result["classifier_wav"])
@@ -145,7 +176,7 @@ def analyze_video_task(
 
         # ── Step 4: Score Fusion ─────────────────────────
         _set_job_status(job_id, "scoring", progress=75.0)
-        logger.info("[%s] Step 4/5: Score fusion…", job_id)
+        logger.info("[%s] Step 4/6: Score fusion…", job_id)
 
         from app.services.haptic_scorer import fuse_scores
         timeline = fuse_scores(
@@ -153,13 +184,14 @@ def analyze_video_task(
             ai=ai_result,
             sensitivity=sensitivity,
             bass_boost=bass_boost,
+            video=video_features,
         )
 
         _set_job_status(job_id, "scoring", progress=85.0)
 
         # ── Step 5: AHAP Generation ─────────────────────
         _set_job_status(job_id, "generating_ahap", progress=90.0)
-        logger.info("[%s] Step 5/5: Generating AHAP…", job_id)
+        logger.info("[%s] Step 5/6: Generating AHAP…", job_id)
 
         from app.services.ahap_generator import generate_ahap, save_ahap
         ahap = generate_ahap(timeline, job_id)

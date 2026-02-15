@@ -21,7 +21,8 @@ tensorflow-hub>=0.16.1
 
 # ── Speech Detection (Whisper via CTranslate2, no PyTorch) ──
 faster-whisper>=1.0.0
-
+# ── Video Analysis (motion + action recognition) ────────
+opencv-python-headless>=4.8.0
 # ── Utilities ────────────────────────────────────────────
 python-dotenv==1.0.1
 

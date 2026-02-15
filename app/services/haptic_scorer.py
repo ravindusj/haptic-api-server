@@ -34,6 +34,8 @@ from app.models.schemas import (
     DSPFeatures,
     HapticEvent,
     HapticTimeline,
+    SceneChange,
+    VideoFeatures,
 )
 
 logger = logging.getLogger(__name__)
@@ -52,13 +54,14 @@ class ScoringWeights:
     meaningful sounds identified by YAMNet.
     """
 
-    percussive: float = 0.25   # HPSS percussive RMS
-    sub_bass: float = 0.20     # 20-60 Hz deep rumble
-    bass: float = 0.20         # 60-250 Hz punch
+    percussive: float = 0.20   # HPSS percussive RMS
+    sub_bass: float = 0.18     # 20-60 Hz deep rumble
+    bass: float = 0.18         # 60-250 Hz punch
     low_mid: float = 0.05      # 250-500 Hz body
     mid: float = 0.05          # 500-2000 Hz texture
-    presence: float = 0.05     # 2000-4000 Hz detail
-    ai: float = 0.20           # YAMNet haptic score
+    presence: float = 0.04     # 2000-4000 Hz detail
+    ai: float = 0.17           # YAMNet haptic score
+    video: float = 0.13        # Video motion intensity
 
 
 # ── Public API ───────────────────────────────────────────
@@ -69,10 +72,12 @@ def fuse_scores(
     ai: AIClassification,
     sensitivity: float = 0.5,
     bass_boost: float = 1.0,
+    video: VideoFeatures | None = None,
 ) -> HapticTimeline:
     """
-    Combine HPSS-separated DSP + YAMNet/Whisper AI signals into a
-    continuous haptic envelope plus transient accent events.
+    Combine HPSS-separated DSP + YAMNet/Whisper AI signals + video
+    motion/action recognition into a continuous haptic envelope plus
+    transient accent events.
     """
     weights = ScoringWeights()
     n_frames = dsp.total_frames
@@ -164,6 +169,39 @@ def fuse_scores(
         + harmonic_contribution
     )
 
+    # ── Video motion contribution ────────────────────────
+    # Resample video motion_intensity to DSP frame rate and add
+    # as a weighted signal.  When no video data, weight is zero.
+    video_motion = np.zeros(n_frames, dtype=np.float64)
+    video_actions: list[str] = []
+    video_action_scores: dict[str, np.ndarray] = {}
+    if video is not None and video.motion_intensity:
+        video_motion = _resample_to_length(
+            np.array(video.motion_intensity, dtype=np.float64), n_frames
+        )
+        combined += weights.video * video_motion
+        logger.info(
+            "Video motion fused: avg=%.3f, peak=%.3f",
+            float(np.mean(video_motion)),
+            float(np.max(video_motion)),
+        )
+        # Resample action labels to DSP frame rate
+        if video.dominant_actions:
+            _va_n = len(video.dominant_actions)
+            _va_idx = np.clip(
+                (np.arange(n_frames) * frame_dur / video.action_window_duration_s).astype(int),
+                0, _va_n - 1,
+            )
+            video_actions = [video.dominant_actions[i] for i in _va_idx]
+            # Resample per-category scores
+            for cat, scores in video.action_scores.items():
+                if scores:
+                    video_action_scores[cat] = _resample_to_length(
+                        np.array(scores, dtype=np.float64), n_frames
+                    )
+        else:
+            video_actions = ["none"] * n_frames
+
     # ── Impact amplification ─────────────────────────────
     # When percussive + bass are both strong → genuine impact.
     # Boost by up to 2.5× so explosions/hits feel powerful.
@@ -175,6 +213,22 @@ def fuse_scores(
     # Percussive-only boost for crashes that lack strong bass
     perc_only_boost = np.where(perc_rms > 0.20, 1.0 + 0.8 * perc_rms, 1.0)
     combined *= impact_factor * perc_only_boost
+
+    # ── Scenario-specific modulation from video actions ──
+    # Each detected action scenario applies a distinct pattern
+    # to the haptic signal for differentiated feel.
+    scenario_transients: list[HapticEvent] = []
+    if video_actions:
+        combined, sharpness_mod, scenario_transients = _apply_scenario_modulation(
+            combined=combined,
+            video_actions=video_actions,
+            video_motion=video_motion,
+            video_action_scores=video_action_scores,
+            frame_dur=frame_dur,
+            n_frames=n_frames,
+        )
+    else:
+        sharpness_mod = np.zeros(n_frames, dtype=np.float64)
 
     # ── Apply speech gate (once only) ─────────────────────
     combined *= speech_gate
@@ -252,6 +306,12 @@ def fuse_scores(
         sharpness = 0.50 * semantic_sharpness + 0.50 * sharpness
         sharpness = np.clip(sharpness, 0.05, 0.95)
 
+    # ── Blend video scenario sharpness modifier ──────────
+    # The scenario modulation function returns a sharpness offset
+    # that is blended in additively (clamped to 0-1).
+    if np.any(sharpness_mod != 0):
+        sharpness = np.clip(sharpness + 0.55 * sharpness_mod, 0.05, 0.95)
+
     # ── Downsample to envelope rate (~20 fps) ────────────
     intensity_env, actual_env_fps = _downsample_max(envelope_signal, frame_dur, ENVELOPE_FPS)
     sharpness_env, _ = _downsample_mean(sharpness, frame_dur, ENVELOPE_FPS)
@@ -278,6 +338,38 @@ def fuse_scores(
         ai_haptic=ai_haptic,
         dsp_dominant=dsp_dominant,
     )
+
+    # ── Scene-cut accent transients from video ───────────
+    # Each detected scene change gets a tap scaled by cut magnitude.
+    if video is not None and video.scene_changes:
+        min_interval_sc = settings.MIN_TRANSIENT_INTERVAL_MS / 1000.0
+        for sc in video.scene_changes:
+            too_close = any(abs(e.time - sc.time) < min_interval_sc for e in events)
+            if not too_close:
+                # Scale by magnitude: gentle dissolve → soft, hard cut → sharp
+                norm_mag = min(sc.magnitude / 5.0, 1.0)
+                events.append(HapticEvent(
+                    time=round(sc.time, 4),
+                    event_type="transient",
+                    duration=0.0,
+                    intensity=round(0.50 + 0.50 * norm_mag, 4),
+                    sharpness=round(0.40 + 0.50 * norm_mag, 4),
+                ))
+        events.sort(key=lambda e: e.time)
+        logger.info("Added %d scene-cut transients", len(video.scene_changes))
+
+    # ── Video scenario transients ────────────────────
+    # Per-scenario transient events from action recognition.
+    if scenario_transients:
+        min_interval_vt = settings.MIN_TRANSIENT_INTERVAL_MS / 1000.0
+        added_vt = 0
+        for vt in scenario_transients:
+            too_close = any(abs(e.time - vt.time) < min_interval_vt for e in events)
+            if not too_close:
+                events.append(vt)
+                added_vt += 1
+        events.sort(key=lambda e: e.time)
+        logger.info("Added %d/%d scenario-specific transients", added_vt, len(scenario_transients))
 
     # Compute speech suppression percentage
     whisper_pct = 0.0
@@ -478,6 +570,248 @@ def _extract_transient_events(
 
     events.sort(key=lambda e: e.time)
     return events
+
+
+# ── Scenario-specific haptic modulation ──────────────────
+
+
+def _apply_scenario_modulation(
+    combined: np.ndarray,
+    video_actions: list[str],
+    video_motion: np.ndarray,
+    video_action_scores: dict[str, np.ndarray],
+    frame_dur: float,
+    n_frames: int,
+) -> tuple[np.ndarray, np.ndarray, list[HapticEvent]]:
+    """Apply scenario-specific intensity/sharpness patterns with temporal waveforms.
+
+    Each action category produces a distinct haptic feel with unique
+    temporal dynamics and per-scenario transient events:
+
+    - **impact** (fighting): exponential decay after peak, double-tap transients
+    - **chase** (running):   adaptive-cadence pulsing (2-6 Hz) + accent taps
+    - **crash** (collisions): sustain plateau → damped oscillation aftershock,
+                              5-tap decaying burst transients
+    - **fall** (jumping):    rising ramp → landing spike, landing thud transient
+    - **driving** (racing):  engine RPM oscillation, deep sharpness
+    - **sports_hit**:        accent boost with sharp crack transient
+
+    Returns
+    -------
+    combined : np.ndarray
+        Modified intensity signal.
+    sharpness_mod : np.ndarray
+        Additive sharpness modifier (-1 to +1) to blend with base sharpness.
+    scenario_transients : list[HapticEvent]
+        Per-scenario transient (tap) events.
+    """
+    result = combined.copy()
+    sharpness_mod = np.zeros(n_frames, dtype=np.float64)
+    transients: list[HapticEvent] = []
+
+    # ── Temporal state tracking ──────────────────────────
+    chase_phase = 0.0              # phase accumulator for adaptive cadence
+    impact_peak_t = -10.0          # time of last impact peak
+    impact_peak_val = 0.0          # boost value at peak
+    crash_peak_t = -10.0           # time of last crash peak
+    crash_peak_val = 0.0           # crash boost at peak
+    fall_start_t = -10.0           # start of current fall sequence
+    fall_landed = False            # whether landing thud has fired
+    prev_action = "none"
+
+    # ── Transient cooldowns ──────────────────────────────
+    last_impact_tap_t = -10.0
+    last_chase_tap_t = -10.0
+    last_crash_burst_t = -10.0
+    last_sports_tap_t = -10.0
+
+    IMPACT_TAP_CD = 0.30           # seconds between impact double-taps
+    CHASE_TAP_CD = 0.12            # seconds between chase accent taps
+    CRASH_BURST_CD = 0.60          # seconds between crash burst salvos
+    SPORTS_TAP_CD = 0.40           # seconds between sports crack taps
+
+    for fi in range(n_frames):
+        if fi >= len(video_actions):
+            break
+        action = video_actions[fi]
+        t = fi * frame_dur
+        motion = float(video_motion[fi]) if fi < len(video_motion) else 0.0
+
+        # Reset state on scenario transitions
+        if action != prev_action:
+            if action == "fall":
+                fall_start_t = t
+                fall_landed = False
+            if action == "chase":
+                chase_phase = 0.0
+
+        # ── IMPACT ───────────────────────────────────────
+        if action == "impact":
+            score = video_action_scores.get("impact", np.zeros(1))
+            s = float(score[min(fi, len(score) - 1)]) if len(score) > 0 else 0.0
+            raw_boost = max(s, motion)
+
+            # Track peak for decay envelope
+            if raw_boost > 0.25 and raw_boost >= impact_peak_val * 0.8:
+                impact_peak_t = t
+                impact_peak_val = raw_boost
+
+            # Exponential decay after peak (tau=150ms)
+            dt = t - impact_peak_t
+            decay = np.exp(-dt / 0.15) if 0 < dt < 2.0 else 1.0
+
+            result[fi] *= 1.0 + 0.5 * raw_boost * decay
+            sharpness_mod[fi] = 0.50  # metallic punch
+
+            # Double-tap transient when motion spikes
+            if raw_boost > 0.20 and (t - last_impact_tap_t) > IMPACT_TAP_CD:
+                prev_m = float(video_motion[fi - 1]) if fi > 0 and fi - 1 < len(video_motion) else 0.0
+                motion_deriv = motion - prev_m
+                if motion_deriv > 0.12 or s > 0.15:
+                    tap_int = min(1.0, 0.85 * raw_boost + 0.15)
+                    transients.append(HapticEvent(
+                        time=round(t, 4),
+                        event_type="transient",
+                        intensity=round(tap_int, 4),
+                        sharpness=0.90,
+                    ))
+                    transients.append(HapticEvent(
+                        time=round(t + 0.040, 4),
+                        event_type="transient",
+                        intensity=round(tap_int * 0.70, 4),
+                        sharpness=0.60,
+                    ))
+                    last_impact_tap_t = t
+
+        # ── CHASE ────────────────────────────────────────
+        elif action == "chase":
+            # Adaptive cadence: 2 Hz jog → 6 Hz sprint
+            freq = 2.0 + 4.0 * motion
+            chase_phase += 2.0 * np.pi * freq * frame_dur
+            pulse = 0.5 + 0.5 * np.sin(chase_phase)
+
+            result[fi] *= 0.65 + 0.35 * pulse * max(0.3, motion)
+            sharpness_mod[fi] = 0.15  # footstep crispness
+
+            # Accent tap at pulse peaks
+            if (pulse > 0.92
+                    and motion > 0.15
+                    and (t - last_chase_tap_t) > CHASE_TAP_CD):
+                tap_int = min(1.0, 0.35 + 0.40 * motion)
+                transients.append(HapticEvent(
+                    time=round(t, 4),
+                    event_type="transient",
+                    intensity=round(tap_int, 4),
+                    sharpness=0.55,
+                ))
+                last_chase_tap_t = t
+
+        # ── CRASH ────────────────────────────────────────
+        elif action == "crash":
+            score = video_action_scores.get("crash", np.zeros(1))
+            s = float(score[min(fi, len(score) - 1)]) if len(score) > 0 else 0.0
+            raw_crash = max(s, motion)
+
+            # Track crash peak
+            if raw_crash > 0.25 and raw_crash >= crash_peak_val * 0.7:
+                crash_peak_t = t
+                crash_peak_val = raw_crash
+
+            dt = t - crash_peak_t
+            if 0 <= dt < 0.20:
+                # Sustain plateau: high intensity during initial crash
+                result[fi] *= 1.0 + 0.7 * raw_crash
+                sharpness_mod[fi] = 0.55 * max(0.2, motion)
+            elif 0.20 <= dt < 1.5:
+                # Damped oscillation aftershock
+                decay_phase = dt - 0.20
+                aftershock = crash_peak_val * np.exp(-4.0 * decay_phase) * (
+                    0.5 + 0.5 * np.sin(2.0 * np.pi * 8.0 * decay_phase)
+                )
+                result[fi] *= 1.0 + 0.5 * max(0.0, aftershock)
+                sharpness_mod[fi] = 0.55 * max(0.1, motion) * np.exp(-3.0 * decay_phase)
+            else:
+                result[fi] *= 1.0 + 0.3 * raw_crash
+                sharpness_mod[fi] = 0.20 * motion
+
+            # 5-tap decaying burst at crash peak
+            if (raw_crash > 0.25
+                    and dt < 0.05
+                    and (t - last_crash_burst_t) > CRASH_BURST_CD):
+                burst_offsets = [0.0, 0.025, 0.055, 0.095, 0.145]
+                burst_int_scale = [1.0, 0.75, 0.50, 0.30, 0.15]
+                burst_sharp = [0.95, 0.80, 0.60, 0.40, 0.20]
+                base_int = min(1.0, 0.80 + 0.20 * raw_crash)
+                for bi in range(5):
+                    transients.append(HapticEvent(
+                        time=round(t + burst_offsets[bi], 4),
+                        event_type="transient",
+                        intensity=round(base_int * burst_int_scale[bi], 4),
+                        sharpness=burst_sharp[bi],
+                    ))
+                last_crash_burst_t = t
+
+        # ── FALL ─────────────────────────────────────────
+        elif action == "fall":
+            elapsed = t - fall_start_t
+            # Rising ramp over ~2 seconds
+            ramp = min(1.0, elapsed / 2.0)
+
+            if motion > 0.5 and not fall_landed:
+                # Landing spike: high-intensity impact
+                result[fi] *= 1.0 + 0.8 * motion
+                sharpness_mod[fi] = 0.35 * motion
+
+                # Landing thud transient — deep, heavy tap
+                transients.append(HapticEvent(
+                    time=round(t, 4),
+                    event_type="transient",
+                    intensity=0.95,
+                    sharpness=0.15,  # deep thud
+                ))
+                fall_landed = True
+            else:
+                # During fall: gradual intensity build
+                result[fi] *= 1.0 + 0.55 * ramp * motion
+                sharpness_mod[fi] = 0.15 * ramp  # gradually sharpens
+
+        # ── DRIVING ──────────────────────────────────────
+        elif action == "driving":
+            # Engine RPM oscillation: 1.5 Hz idle → 4.5 Hz high RPM
+            f_rpm = 1.5 + 3.0 * motion
+            engine_osc = 0.15 * np.sin(2.0 * np.pi * f_rpm * t)
+
+            # Steady vibration floor + engine oscillation
+            result[fi] = max(result[fi], 0.30 + 0.30 * motion + engine_osc)
+            sharpness_mod[fi] = -0.50  # deep engine rumble
+
+        # ── SPORTS_HIT ───────────────────────────────────
+        elif action == "sports_hit":
+            score = video_action_scores.get("sports_hit", np.zeros(1))
+            s = float(score[min(fi, len(score) - 1)]) if len(score) > 0 else 0.0
+            result[fi] *= 1.0 + 0.4 * max(s, motion * 0.5)
+            sharpness_mod[fi] = 0.45  # crisp crack
+
+            # Sharp crack transient
+            if s > 0.12 and (t - last_sports_tap_t) > SPORTS_TAP_CD:
+                tap_int = min(1.0, 0.70 + 0.30 * s)
+                transients.append(HapticEvent(
+                    time=round(t, 4),
+                    event_type="transient",
+                    intensity=round(tap_int, 4),
+                    sharpness=0.95,  # maximum crispness
+                ))
+                last_sports_tap_t = t
+
+        prev_action = action
+
+    # Smooth with reduced window (~50 ms) to preserve waveform detail
+    smooth_win = max(1, int(0.05 / frame_dur))
+    result = _smooth(result, smooth_win)
+    sharpness_mod = _smooth(sharpness_mod, smooth_win)
+
+    transients.sort(key=lambda e: e.time)
+    return result, sharpness_mod, transients
 
 
 # ── Envelope helpers ─────────────────────────────────────
