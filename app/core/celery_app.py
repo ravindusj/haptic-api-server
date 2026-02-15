@@ -75,6 +75,84 @@ def get_job_status(job_id: str) -> dict | None:
     return data if data else None
 
 
+# ── Analysis data persistence for visualization ─────────
+
+
+def _save_analysis_data(
+    job_id: str,
+    dsp,
+    ai,
+    video,
+    timeline,
+) -> None:
+    """Persist intermediate analysis data for the /visualize endpoint."""
+    results_dir = Path(settings.RESULTS_DIR) / job_id
+    results_dir.mkdir(parents=True, exist_ok=True)
+    analysis_path = results_dir / f"{job_id}_analysis.json"
+
+    data = {
+        "dsp": {
+            "sample_rate": dsp.sample_rate,
+            "hop_length": dsp.hop_length,
+            "duration_seconds": dsp.duration_seconds,
+            "rms_energy": dsp.rms_energy,
+            "percussive_rms": dsp.percussive_rms,
+            "harmonic_rms": dsp.harmonic_rms,
+            "spectral_centroid": dsp.spectral_centroid,
+            "sub_bass_energy": dsp.sub_bass_energy,
+            "bass_energy": dsp.bass_energy,
+            "low_mid_energy": dsp.low_mid_energy,
+            "mid_energy": dsp.mid_energy,
+            "presence_energy": dsp.presence_energy,
+            "brilliance_energy": dsp.brilliance_energy,
+            "beat_times": dsp.beat_times,
+            "beat_strengths": dsp.beat_strengths,
+        },
+        "ai": {
+            "haptic_scores": ai.haptic_scores,
+            "speech_scores": ai.speech_scores,
+            "dominant_classes": ai.dominant_classes,
+            "speech_segments": [
+                {"start": s.start, "end": s.end, "confidence": s.confidence}
+                for s in ai.speech_segments
+            ],
+        },
+        "video": None,
+        "timeline": {
+            "intensity_envelope": timeline.intensity_envelope,
+            "sharpness_envelope": timeline.sharpness_envelope,
+            "envelope_fps": timeline.envelope_fps,
+            "duration_seconds": timeline.duration_seconds,
+            "events": [
+                {
+                    "time": e.time,
+                    "event_type": e.event_type,
+                    "intensity": e.intensity,
+                    "sharpness": e.sharpness,
+                }
+                for e in timeline.events
+            ],
+        },
+    }
+
+    if video is not None:
+        data["video"] = {
+            "motion_intensity": video.motion_intensity,
+            "scene_changes": [
+                {"time": sc.time, "magnitude": sc.magnitude}
+                for sc in video.scene_changes
+            ],
+            "dominant_actions": video.dominant_actions,
+            "action_scores": video.action_scores,
+            "action_window_duration_s": video.action_window_duration_s,
+        }
+
+    with open(analysis_path, "w") as f:
+        json.dump(data, f)
+
+    logger.info("[%s] Analysis data saved: %s", job_id, analysis_path)
+
+
 # ── Main pipeline task ───────────────────────────────────
 
 @celery_app.task(bind=True, name="haptic.analyze_video", max_retries=1)
@@ -188,6 +266,14 @@ def analyze_video_task(
         )
 
         _set_job_status(job_id, "scoring", progress=85.0)
+
+        # ── Persist analysis data for visualization ──────
+        try:
+            _save_analysis_data(
+                job_id, dsp_features, ai_result, video_features, timeline,
+            )
+        except Exception as save_err:
+            logger.warning("[%s] Analysis data save failed (non-fatal): %s", job_id, save_err)
 
         # ── Step 5: AHAP Generation ─────────────────────
         _set_job_status(job_id, "generating_ahap", progress=90.0)

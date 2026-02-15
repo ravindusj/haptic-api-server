@@ -275,6 +275,55 @@ async def preview_timeline(job_id: str):
     })
 
 
+# ── GET /visualize/{job_id} ──────────────────────────────
+
+
+@router.get(
+    "/visualize/{job_id}",
+    summary="Visualize haptic vs audio analysis comparison graph",
+    description=(
+        "Returns a PNG image with 5 panels comparing the audio analysis "
+        "(RMS energy, frequency bands, spectral centroid, beats, speech) "
+        "with the generated haptic output (intensity envelope, sharpness, "
+        "transient events) and video analysis (motion, actions, scene cuts). "
+        "Available after job completion."
+    ),
+    responses={
+        200: {"content": {"image/png": {}}, "description": "Comparison graph PNG"},
+        404: {"description": "Job not found or analysis data missing"},
+        409: {"description": "Job not yet complete"},
+    },
+)
+async def visualize_job(job_id: str):
+    """Generate and return a visual comparison graph as PNG."""
+    from fastapi.responses import Response
+    from app.services.visualizer import generate_visualization
+
+    data = get_job_status(job_id)
+    if not data:
+        raise HTTPException(404, f"Job '{job_id}' not found.")
+
+    if data.get("status") != "completed":
+        raise HTTPException(
+            409,
+            f"Job is not complete yet. Status: {data.get('status')}",
+        )
+
+    try:
+        png_bytes = generate_visualization(job_id)
+    except FileNotFoundError as e:
+        raise HTTPException(404, str(e))
+
+    return Response(
+        content=png_bytes,
+        media_type="image/png",
+        headers={
+            "Content-Disposition": f'inline; filename="{job_id}_analysis.png"',
+            "Cache-Control": "public, max-age=3600",
+        },
+    )
+
+
 # ── GET /health ──────────────────────────────────────────
 
 
