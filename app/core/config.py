@@ -44,6 +44,14 @@ class Settings(BaseSettings):
     MAX_AHAP_EVENTS_PER_CHUNK: int = 128  # Apple limit per pattern
     AHAP_CHUNK_DURATION_S: float = 30.0   # Apple limit per pattern
 
+    # ── AHAP Segmentation ────────────────────────────────
+    # Short HapticContinuous segments prevent Apple Core Haptics
+    # from auto-reducing intensity on long carriers.
+    HAPTIC_SEGMENT_DURATION_S: float = 2.0       # carrier segment length
+    HAPTIC_SEGMENT_OVERLAP_S: float = 0.05       # 50 ms overlap between segments
+    HAPTIC_CURVE_VARIANCE_THRESHOLD: float = 0.03  # std-dev below → static params
+    HAPTIC_REST_INTENSITY_THRESHOLD: float = 0.02   # max intensity below → skip segment
+
     # ── YAMNet Model ─────────────────────────────────────
     YAMNET_MODEL_HANDLE: str = "https://tfhub.dev/google/yamnet/1"
 

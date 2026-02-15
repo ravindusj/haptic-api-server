@@ -3,25 +3,26 @@
 Converts a HapticTimeline into a valid AHAP JSON file that can be
 played by Apple's Core Haptics framework on iPhones (iPhone 8+).
 
-Architecture
-------------
-The generator uses Apple's ParameterCurve mechanism for Sony-DVS-style
-continuous sound-to-vibration mapping:
+Architecture — Segmented Carriers
+----------------------------------
+Apple Core Haptics auto-reduces intensity and may desync or kill
+long HapticContinuous events (>3-5 s).  This generator therefore
+splits every 30 s chunk into **many short 2 s HapticContinuous
+carriers** ("segments"), each with its own ParameterCurves.
 
-  1. **One HapticContinuous event** per chunk spans the full chunk
-     duration at intensity=1.0 (the "carrier signal").
-  2. **A HapticIntensityControl ParameterCurve** with one control point
-     every ~50 ms modulates the carrier multiplicatively, so the
-     vibration intensity tracks the audio energy envelope frame-by-frame.
-  3. **A HapticSharpnessControl ParameterCurve** tracks tonal content
-     (bass → dull, treble → sharp).
-  4. **HapticTransient events** are overlaid at onset / beat positions
-     for punchy impact accents on top of the continuous rumble.
+  1. Each 30 s chunk is subdivided into ~15 × 2 s **segments**.
+  2. Segments where max intensity < 0.02 are **skipped** ("rest").
+  3. If the envelope inside a segment has std-dev < 0.03 the carrier
+     uses **static** HapticIntensity / HapticSharpness (no curve).
+  4. Otherwise a short ParameterCurve modulates the segment carrier.
+  5. Adjacent segments overlap by 50 ms for seamless transitions.
+  6. HapticTransient events are **debounced** at 50 ms minimum interval.
+  7. Per-chunk event limit (128) counts only Event entries, not
+     ParameterCurve entries.
 
 AHAP spec constraints:
   - Version 1.0
-  - Max ~128 Event entries per CHHapticPattern (ParameterCurves are
-    separate and don't count toward this limit)
+  - Max ~128 Event entries per CHHapticPattern
   - Max ~30 seconds per pattern
   - EventTypes: HapticTransient, HapticContinuous
   - Parameters: HapticIntensity (0-1), HapticSharpness (0-1)
@@ -35,9 +36,12 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 from pathlib import Path
 from typing import Any
+
+import numpy as np
 
 from app.core.config import get_settings
 from app.models.schemas import (
@@ -51,12 +55,16 @@ logger = logging.getLogger(__name__)
 settings = get_settings()
 
 
+# ─────────────────────────────────────────────────────────
+# Public API
+# ─────────────────────────────────────────────────────────
+
+
 def generate_ahap(
     timeline: HapticTimeline,
     job_id: str,
 ) -> AHAPFile:
-    """
-    Convert a HapticTimeline into a full AHAP file.
+    """Convert a HapticTimeline into a segmented AHAP file.
 
     Parameters
     ----------
@@ -68,7 +76,8 @@ def generate_ahap(
     Returns
     -------
     AHAPFile
-        Contains one or more AHAP pattern chunks.
+        Contains one or more AHAP pattern chunks, each built from
+        many short 2 s HapticContinuous segments.
     """
     events = sorted(timeline.events, key=lambda e: e.time)
     duration = timeline.duration_seconds
@@ -78,7 +87,7 @@ def generate_ahap(
     sharpness_env = timeline.sharpness_envelope
     env_fps = timeline.envelope_fps or 20.0
 
-    # ── Split into time-based chunks ─────────────────────
+    # ── Split into time-based chunks (≤30 s each) ────────
     chunks: list[AHAPPattern] = []
     n_chunks = max(1, int(duration / chunk_dur) + (1 if duration % chunk_dur > 0.01 else 0))
 
@@ -125,7 +134,9 @@ def generate_ahap(
             )
         )
 
-    total_events = sum(len(c.pattern) for c in chunks)
+    # Count only real events (HapticContinuous + HapticTransient),
+    # not ParameterCurve entries.
+    total_events = _count_events(chunks)
 
     ahap = AHAPFile(
         chunks=chunks,
@@ -134,31 +145,32 @@ def generate_ahap(
         metadata={
             **timeline.metadata,
             "total_chunks": len(chunks),
+            "segment_duration_s": settings.HAPTIC_SEGMENT_DURATION_S,
         },
     )
 
     logger.info(
-        "AHAP generated: %d chunks, %d events, %.1fs duration",
+        "AHAP generated: %d chunks, %d events, %.1fs duration "
+        "(segment=%.1fs, hybrid curves)",
         len(chunks),
         total_events,
         duration,
+        settings.HAPTIC_SEGMENT_DURATION_S,
     )
 
     return ahap
 
 
 def save_ahap(ahap: AHAPFile, job_id: str) -> str:
-    """
-    Save AHAP to disk. Returns the file path.
+    """Save AHAP to disk.  Returns the file path.
 
-    If there's only one chunk, save as a single `.ahap` file.
-    If multiple chunks, save a combined JSON with chunk array + individual files.
+    If there's only one chunk, save as a single ``.ahap`` file.
+    If multiple chunks, save individual files + manifest + combined.
     """
     results_dir = Path(settings.RESULTS_DIR) / job_id
     os.makedirs(results_dir, exist_ok=True)
 
     if len(ahap.chunks) == 1:
-        # Single file
         ahap_data = _chunk_to_ahap_dict(ahap.chunks[0])
         file_path = str(results_dir / f"{job_id}.ahap")
         with open(file_path, "w") as f:
@@ -172,6 +184,7 @@ def save_ahap(ahap: AHAPFile, job_id: str) -> str:
         "total_duration": ahap.total_duration,
         "total_events": ahap.total_events,
         "total_chunks": len(ahap.chunks),
+        "segment_duration_s": settings.HAPTIC_SEGMENT_DURATION_S,
         "chunks": [],
     }
 
@@ -187,7 +200,7 @@ def save_ahap(ahap: AHAPFile, job_id: str) -> str:
             "index": chunk.chunk_index,
             "start_time": chunk.start_time,
             "end_time": chunk.end_time,
-            "event_count": len(chunk.pattern),
+            "event_count": _count_events([chunk]),
         })
 
     # Save manifest
@@ -209,7 +222,9 @@ def save_ahap(ahap: AHAPFile, job_id: str) -> str:
     return combined_path
 
 
-# ── Internal builders ────────────────────────────────────
+# ─────────────────────────────────────────────────────────
+# Internal builders
+# ─────────────────────────────────────────────────────────
 
 
 def _build_pattern(
@@ -221,62 +236,106 @@ def _build_pattern(
     chunk_duration: float,
     chunk_index: int,
 ) -> AHAPPattern:
-    """Build one AHAP pattern chunk.
+    """Build one AHAP pattern chunk using short 2 s carrier segments.
 
-    Emits:
-      1. One HapticContinuous event spanning the chunk at intensity=1.0
-      2. A HapticIntensityControl ParameterCurve from the envelope
-      3. A HapticSharpnessControl ParameterCurve from the envelope
-      4. HapticTransient events for accent taps
+    Instead of a single HapticContinuous spanning the full 30 s chunk,
+    emits many short carriers.  Each segment gets either static params
+    (flat envelope) or a short ParameterCurve (varying envelope).
+    Rest segments (intensity < threshold) are skipped entirely.
     """
+    seg_dur = settings.HAPTIC_SEGMENT_DURATION_S
+    overlap = settings.HAPTIC_SEGMENT_OVERLAP_S
+    var_threshold = settings.HAPTIC_CURVE_VARIANCE_THRESHOLD
+    rest_threshold = settings.HAPTIC_REST_INTENSITY_THRESHOLD
+
     pattern_entries: list[dict[str, Any]] = []
 
-    # ── 1. Continuous carrier event ──────────────────────
-    # Spans the full chunk duration; the ParameterCurve modulates
-    # its intensity multiplicatively.
-    pattern_entries.append({
-        "Event": {
-            "Time": 0.0,
-            "EventType": "HapticContinuous",
-            "EventDuration": round(chunk_duration, 4),
-            "EventParameters": [
-                {"ParameterID": "HapticIntensity", "ParameterValue": 1.0},
-                {"ParameterID": "HapticSharpness", "ParameterValue": 1.0},
-            ],
-        }
-    })
+    int_arr = np.array(intensity_envelope, dtype=np.float64) if intensity_envelope else np.array([], dtype=np.float64)
+    shp_arr = np.array(sharpness_envelope, dtype=np.float64) if sharpness_envelope else np.array([], dtype=np.float64)
 
-    # ── 2. Intensity ParameterCurve ──────────────────────
-    if intensity_envelope:
-        intensity_curve = _build_parameter_curve(
-            envelope=intensity_envelope,
-            fps=envelope_fps,
-            parameter_id="HapticIntensityControl",
-        )
-        if intensity_curve:
-            pattern_entries.append(intensity_curve)
+    n_segments = max(1, math.ceil(chunk_duration / seg_dur))
+    carrier_count = 0
 
-    # ── 3. Sharpness ParameterCurve ──────────────────────
-    if sharpness_envelope:
-        sharpness_curve = _build_parameter_curve(
-            envelope=sharpness_envelope,
-            fps=envelope_fps,
-            parameter_id="HapticSharpnessControl",
-        )
-        if sharpness_curve:
-            pattern_entries.append(sharpness_curve)
+    for si in range(n_segments):
+        seg_start_rel = si * seg_dur                      # relative to chunk
+        seg_end_rel = min(seg_start_rel + seg_dur + overlap, chunk_duration)
+        seg_actual_dur = seg_end_rel - seg_start_rel
 
-    # ── 4. Transient accent taps ─────────────────────────
-    # Enforce Apple's per-chunk event limit.
-    # The HapticContinuous carrier counts as 1, so transients
-    # get (MAX - 1) slots.  Keep the highest-intensity ones.
-    max_transients = settings.MAX_AHAP_EVENTS_PER_CHUNK - 1  # reserve 1 for carrier
-    if len(transient_events) > max_transients:
-        # Sort by intensity descending, keep top-N, re-sort by time
-        transient_events = sorted(transient_events, key=lambda e: e.intensity, reverse=True)[:max_transients]
-        transient_events = sorted(transient_events, key=lambda e: e.time)
+        if seg_actual_dur < 0.01:
+            continue
 
-    for event in transient_events:
+        # ── Slice envelope samples for this segment ──────
+        env_start = round(seg_start_rel * envelope_fps)
+        env_end = round(seg_end_rel * envelope_fps)
+        seg_int = int_arr[env_start:env_end] if len(int_arr) > 0 else np.array([])
+        seg_shp = shp_arr[env_start:env_end] if len(shp_arr) > 0 else np.array([])
+
+        # ── Rest detection: skip silent segments ─────────
+        if len(seg_int) > 0 and float(np.max(seg_int)) < rest_threshold:
+            continue
+
+        # ── Decide: static params vs ParameterCurve ──────
+        int_std = float(np.std(seg_int)) if len(seg_int) > 1 else 0.0
+        shp_std = float(np.std(seg_shp)) if len(seg_shp) > 1 else 0.0
+        use_intensity_curve = int_std >= var_threshold and len(seg_int) > 1
+        use_sharpness_curve = shp_std >= var_threshold and len(seg_shp) > 1
+
+        # Compute static values (mean, clamped 0-1)
+        static_intensity = float(np.clip(np.mean(seg_int), 0.0, 1.0)) if len(seg_int) > 0 else 0.5
+        static_sharpness = float(np.clip(np.mean(seg_shp), 0.0, 1.0)) if len(seg_shp) > 0 else 0.5
+
+        # ── Emit HapticContinuous carrier for segment ────
+        # If using curves, set carrier to 1.0 so curve controls value.
+        # If static, set carrier to the computed mean directly.
+        carrier_intensity = 1.0 if use_intensity_curve else round(static_intensity, 4)
+        carrier_sharpness = 1.0 if use_sharpness_curve else round(static_sharpness, 4)
+
+        pattern_entries.append({
+            "Event": {
+                "Time": round(seg_start_rel, 4),
+                "EventType": "HapticContinuous",
+                "EventDuration": round(seg_actual_dur, 4),
+                "EventParameters": [
+                    {"ParameterID": "HapticIntensity", "ParameterValue": carrier_intensity},
+                    {"ParameterID": "HapticSharpness", "ParameterValue": carrier_sharpness},
+                ],
+            }
+        })
+        carrier_count += 1
+
+        # ── Intensity ParameterCurve (if needed) ─────────
+        if use_intensity_curve:
+            curve = _build_parameter_curve(
+                envelope=seg_int.tolist(),
+                fps=envelope_fps,
+                parameter_id="HapticIntensityControl",
+                time_offset=seg_start_rel,
+            )
+            if curve:
+                pattern_entries.append(curve)
+
+        # ── Sharpness ParameterCurve (if needed) ─────────
+        if use_sharpness_curve:
+            curve = _build_parameter_curve(
+                envelope=seg_shp.tolist(),
+                fps=envelope_fps,
+                parameter_id="HapticSharpnessControl",
+                time_offset=seg_start_rel,
+            )
+            if curve:
+                pattern_entries.append(curve)
+
+    # ── Transient accent taps (with debounce) ────────────
+    debounced = _debounce_transients(transient_events)
+
+    # Enforce per-chunk event limit: carriers + transients ≤ 128
+    max_transients = settings.MAX_AHAP_EVENTS_PER_CHUNK - carrier_count
+    max_transients = max(0, max_transients)
+    if len(debounced) > max_transients:
+        debounced = sorted(debounced, key=lambda e: e.intensity, reverse=True)[:max_transients]
+        debounced = sorted(debounced, key=lambda e: e.time)
+
+    for event in debounced:
         rel_time = round(max(0.0, event.time - chunk_start), 4)
         pattern_entries.append(_make_transient(
             rel_time, event.intensity, event.sharpness,
@@ -297,12 +356,18 @@ def _build_parameter_curve(
     envelope: list[float],
     fps: float,
     parameter_id: str,
+    time_offset: float = 0.0,
 ) -> dict[str, Any] | None:
     """Build a ParameterCurve from an envelope array.
 
     Each element becomes a control point spaced at 1/fps seconds.
-    The haptic engine linearly interpolates between points, giving
-    smooth frame-accurate intensity/sharpness modulation.
+    The haptic engine linearly interpolates between points.
+
+    Parameters
+    ----------
+    time_offset : float
+        Absolute time within the chunk where this curve starts.
+        Each control point's Time is relative to the curve's Time field.
     """
     if not envelope:
         return None
@@ -322,10 +387,31 @@ def _build_parameter_curve(
     return {
         "ParameterCurve": {
             "ParameterID": parameter_id,
-            "Time": 0.0,
+            "Time": round(time_offset, 4),
             "ParameterCurveControlPoints": control_points,
         }
     }
+
+
+def _debounce_transients(
+    events: list[HapticEvent],
+) -> list[HapticEvent]:
+    """Remove transients that fire within MIN_TRANSIENT_INTERVAL_MS of
+    the previous accepted transient.  Keeps the first occurrence and
+    drops subsequent ones inside the debounce window.
+    """
+    if not events:
+        return []
+
+    min_gap = settings.MIN_TRANSIENT_INTERVAL_MS / 1000.0  # convert to seconds
+    sorted_evts = sorted(events, key=lambda e: e.time)
+    accepted: list[HapticEvent] = [sorted_evts[0]]
+
+    for evt in sorted_evts[1:]:
+        if (evt.time - accepted[-1].time) >= min_gap:
+            accepted.append(evt)
+
+    return accepted
 
 
 def _make_transient(
@@ -365,83 +451,53 @@ def _chunk_to_ahap_dict(chunk: AHAPPattern) -> dict[str, Any]:
     }
 
 
-def _build_combined_ahap(ahap: AHAPFile) -> dict[str, Any]:
-    """
-    Build a single combined AHAP with all events (absolute times).
+def _count_events(chunks: list[AHAPPattern]) -> int:
+    """Count only Event entries (HapticContinuous + HapticTransient),
+    excluding ParameterCurve entries."""
+    total = 0
+    for chunk in chunks:
+        for entry in chunk.pattern:
+            if "Event" in entry:
+                total += 1
+    return total
 
-    Merges all per-chunk ParameterCurves into **one** curve per
-    ParameterID (HapticIntensityControl, HapticSharpnessControl).
-    Apple Core Haptics does not reliably honour multiple
-    ParameterCurves with the same ParameterID — only the first
-    is applied, leaving later chunks without intensity modulation.
+
+def _build_combined_ahap(ahap: AHAPFile) -> dict[str, Any]:
+    """Build a single combined AHAP with all events (absolute times).
+
+    Unlike the old approach that merged everything into **one** long
+    HapticContinuous carrier, the combined file now preserves the
+    segmented structure: many short 2 s carriers with their per-segment
+    ParameterCurves, all offset to absolute time.
     """
-    merged_curves: dict[str, list[dict[str, float]]] = {}  # paramID → points
-    event_entries: list[dict[str, Any]] = []
-    continuous_start: float | None = None
-    continuous_end: float = 0.0
+    combined_pattern: list[dict[str, Any]] = []
 
     for chunk in ahap.chunks:
         for entry in chunk.pattern:
             if "ParameterCurve" in entry:
                 curve = entry["ParameterCurve"]
-                pid = curve["ParameterID"]
-                if pid not in merged_curves:
-                    merged_curves[pid] = []
-                for pt in curve.get("ParameterCurveControlPoints", []):
-                    merged_curves[pid].append({
-                        "Time": round(pt["Time"] + chunk.start_time, 4),
-                        "ParameterValue": pt["ParameterValue"],
-                    })
+                # Offset the curve's Time to absolute
+                combined_pattern.append({
+                    "ParameterCurve": {
+                        "ParameterID": curve["ParameterID"],
+                        "Time": round(curve["Time"] + chunk.start_time, 4),
+                        "ParameterCurveControlPoints": curve["ParameterCurveControlPoints"],
+                    }
+                })
             elif "Event" in entry:
                 evt = entry["Event"].copy()
                 evt["Time"] = round(evt["Time"] + chunk.start_time, 4)
-                # Track the full span of HapticContinuous carriers
-                if evt["EventType"] == "HapticContinuous":
-                    if continuous_start is None:
-                        continuous_start = evt["Time"]
-                    continuous_end = max(
-                        continuous_end,
-                        evt["Time"] + evt.get("EventDuration", 0),
-                    )
-                else:
-                    event_entries.append({"Event": evt})
+                combined_pattern.append({"Event": evt})
 
-    # ── Single HapticContinuous spanning full duration ───
-    combined_pattern: list[dict[str, Any]] = []
-    total_dur = ahap.total_duration
-    combined_pattern.append({
-        "Event": {
-            "Time": 0.0,
-            "EventType": "HapticContinuous",
-            "EventDuration": round(total_dur, 4),
-            "EventParameters": [
-                {"ParameterID": "HapticIntensity", "ParameterValue": 1.0},
-                {"ParameterID": "HapticSharpness", "ParameterValue": 0.5},
-            ],
-        }
-    })
-
-    # ── One merged ParameterCurve per ID ─────────────────
-    for pid, points in merged_curves.items():
-        # Sort by time and deduplicate
-        points.sort(key=lambda p: p["Time"])
-        combined_pattern.append({
-            "ParameterCurve": {
-                "ParameterID": pid,
-                "Time": 0.0,
-                "ParameterCurveControlPoints": points,
-            }
-        })
-
-    # ── Transient events ─────────────────────────────────
-    combined_pattern.extend(event_entries)
+    total_events = sum(1 for e in combined_pattern if "Event" in e)
 
     return {
         "Version": 1.0,
         "Metadata": {
-            "TotalDuration": total_dur,
-            "TotalEvents": ahap.total_events,
+            "TotalDuration": ahap.total_duration,
+            "TotalEvents": total_events,
             "TotalChunks": len(ahap.chunks),
+            "SegmentDuration": settings.HAPTIC_SEGMENT_DURATION_S,
         },
         "Pattern": combined_pattern,
     }
