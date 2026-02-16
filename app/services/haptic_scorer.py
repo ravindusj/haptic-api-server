@@ -64,6 +64,61 @@ class ScoringWeights:
     video: float = 0.13        # Video motion intensity
 
 
+# ── Style-specific weight presets ────────────────────────
+
+_STYLE_WEIGHTS: dict[str, ScoringWeights] = {
+    "music": ScoringWeights(
+        percussive=0.28, sub_bass=0.22, bass=0.22,
+        low_mid=0.06, mid=0.06, presence=0.04,
+        ai=0.12, video=0.00,          # all-audio for music
+    ),
+    "cinematic": ScoringWeights(
+        percussive=0.15, sub_bass=0.12, bass=0.12,
+        low_mid=0.04, mid=0.04, presence=0.03,
+        ai=0.25, video=0.25,          # heavy AI + video for film
+    ),
+    "auto": ScoringWeights(),         # balanced default
+}
+
+
+def _detect_style(ai: AIClassification) -> str:
+    """Auto-detect content style from YAMNet classification.
+
+    Computes the ratio of music-dominant frames to speech-dominant
+    frames.  If music clearly dominates → "music"; if speech
+    dominates → "cinematic"; otherwise → "auto" (balanced).
+    """
+    if not ai.dominant_classes:
+        return "auto"
+
+    _MUSIC_LABELS = {
+        "Music", "Rock music", "Pop music", "Hip hop music",
+        "Heavy metal", "Punk rock", "Disco", "Electronic music",
+        "Techno", "Drum", "Snare drum", "Bass drum", "Drum kit",
+        "Guitar", "Electric guitar", "Acoustic guitar", "Piano",
+        "Bass guitar", "Singing", "Cymbal", "Hi-hat", "Drum roll",
+        "Synthesizer", "Organ", "Keyboard (musical)",
+    }
+    _SPEECH_LABELS = {
+        "Speech", "Male speech, man speaking",
+        "Female speech, woman speaking", "Child speech, kid speaking",
+        "Conversation", "Narration, monologue",
+    }
+
+    music_count = sum(1 for c in ai.dominant_classes if c in _MUSIC_LABELS)
+    speech_count = sum(1 for c in ai.dominant_classes if c in _SPEECH_LABELS)
+    total = len(ai.dominant_classes)
+
+    music_ratio = music_count / total if total > 0 else 0
+    speech_ratio = speech_count / total if total > 0 else 0
+
+    if music_ratio > 0.40 and music_ratio > speech_ratio * 2:
+        return "music"
+    if speech_ratio > 0.35 and speech_ratio > music_ratio * 1.5:
+        return "cinematic"
+    return "auto"
+
+
 # ── Public API ───────────────────────────────────────────
 
 
@@ -73,13 +128,25 @@ def fuse_scores(
     sensitivity: float = 0.5,
     bass_boost: float = 1.0,
     video: VideoFeatures | None = None,
+    style: str = "auto",
 ) -> HapticTimeline:
     """
     Combine HPSS-separated DSP + YAMNet/Whisper AI signals + video
     motion/action recognition into a continuous haptic envelope plus
     transient accent events.
+
+    Parameters
+    ----------
+    style : str
+        "auto" (detect from content), "music", or "cinematic".
+        Controls the relative weight of each signal source.
     """
-    weights = ScoringWeights()
+    # ── Resolve style → weights ──────────────────────────
+    effective_style = style.lower()
+    if effective_style == "auto":
+        effective_style = _detect_style(ai)
+    weights = _STYLE_WEIGHTS.get(effective_style, ScoringWeights())
+    logger.info("Fusion style: requested=%s, effective=%s", style, effective_style)
     n_frames = dsp.total_frames
     frame_dur = dsp.hop_length / dsp.sample_rate  # ~0.023 s
 
@@ -403,6 +470,7 @@ def fuse_scores(
             "envelope_points": len(intensity_env),
             "speech_suppressed_pct": whisper_pct,
             "whisper_segments": len(ai.speech_segments),
+            "style": effective_style,
         },
     )
 

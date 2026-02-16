@@ -263,6 +263,7 @@ def analyze_video_task(
             sensitivity=sensitivity,
             bass_boost=bass_boost,
             video=video_features,
+            style=style,
         )
 
         _set_job_status(job_id, "scoring", progress=85.0)

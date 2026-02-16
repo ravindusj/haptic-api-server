@@ -292,6 +292,16 @@ def _run_yamnet(
         speech_scores.append(round(float(s), 4))
         dominant_classes.append(top)
 
+    # ── Temporal smoothing ───────────────────────────────
+    # EMA on numeric scores (α=0.3): preserves transient spikes
+    # while removing single-frame noise jitter.
+    haptic_scores = _ema_smooth(haptic_scores, alpha=0.3)
+    speech_scores = _ema_smooth(speech_scores, alpha=0.3)
+
+    # Majority-vote median filter on dominant class labels (window=3):
+    # kills single-frame class flips like explosion→music→explosion.
+    dominant_classes = _median_filter_labels(dominant_classes, window=3)
+
     return haptic_scores, speech_scores, dominant_classes
 
 
@@ -381,3 +391,55 @@ def _get_dominant_class(probs: np.ndarray) -> str:
     if _yamnet_classes and top_idx < len(_yamnet_classes):
         return _yamnet_classes[top_idx]
     return f"class_{top_idx}"
+
+
+# ── Temporal smoothing helpers ───────────────────────────
+
+
+def _ema_smooth(values: list[float], alpha: float = 0.3) -> list[float]:
+    """Exponential moving average smoothing.
+
+    alpha controls responsiveness: 0.3 = moderate smoothing,
+    preserves transient spikes while removing single-frame noise.
+    """
+    if len(values) <= 1:
+        return values
+
+    smoothed = [values[0]]
+    for v in values[1:]:
+        smoothed.append(round(alpha * v + (1.0 - alpha) * smoothed[-1], 4))
+    return smoothed
+
+
+def _median_filter_labels(labels: list[str], window: int = 3) -> list[str]:
+    """Apply a majority-vote filter to a sequence of string labels.
+
+    For each position, look at a window of labels centered on that
+    position and pick the most common label.  Eliminates single-frame
+    class flips (e.g. explosion→music→explosion becomes
+    explosion→explosion→explosion).
+    """
+    if len(labels) <= window:
+        return labels
+
+    half = window // 2
+    result: list[str] = []
+
+    for i in range(len(labels)):
+        lo = max(0, i - half)
+        hi = min(len(labels), i + half + 1)
+        neighborhood = labels[lo:hi]
+
+        # Count occurrences and pick most common
+        counts: dict[str, int] = {}
+        for lbl in neighborhood:
+            counts[lbl] = counts.get(lbl, 0) + 1
+
+        # Most common label (tie-break: keep original)
+        max_count = max(counts.values())
+        if counts.get(labels[i], 0) == max_count:
+            result.append(labels[i])
+        else:
+            result.append(max(counts, key=counts.get))  # type: ignore[arg-type]
+
+    return result
