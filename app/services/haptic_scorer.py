@@ -183,7 +183,7 @@ def fuse_scores(
 
     # ── Build speech mask from Whisper segments ──────────
     # Whisper gives precise [start, end] timestamps for speech.
-    # Convert to per-frame gate: 0 = speech, 1 = non-speech.
+    # Convert to per-frame gate: 0 = speech (hard off), 1 = non-speech.
     speech_gate = _build_whisper_speech_gate(
         speech_segments=ai.speech_segments,
         n_frames=n_frames,
@@ -192,20 +192,21 @@ def fuse_scores(
 
     # Merge with YAMNet speech scores as a backup
     ai_speech = _resample_to_length(np.array(ai.speech_scores), n_frames)
-    yamnet_gate = 1.0 - np.clip((ai_speech - 0.5) / 0.4, 0.0, 1.0)
+    # Tighter YAMNet gate: activates at speech_score > 0.3 (was 0.5)
+    yamnet_gate = 1.0 - np.clip((ai_speech - 0.3) / 0.3, 0.0, 1.0)
     # Take the more suppressive of the two gates
     speech_gate = np.minimum(speech_gate, yamnet_gate)
 
-    # Smooth gate edges (~80 ms crossfade)
-    gate_smooth = max(1, int(0.08 / frame_dur))
+    # Smooth gate edges (~40 ms crossfade — tighter than before)
+    gate_smooth = max(1, int(0.04 / frame_dur))
     speech_gate = _smooth(speech_gate, gate_smooth)
-    speech_gate = np.where(speech_gate < 0.05, 0.0, speech_gate)
+    # Hard cutoff: anything below 0.08 becomes 0.0 (full silence)
+    speech_gate = np.where(speech_gate < 0.08, 0.0, speech_gate)
 
-    # ── Haptic-content override ──────────────────────────
-    # If YAMNet detects strong haptic content (crash, music, etc.),
-    # do NOT let the speech gate kill it — guarantee at least 70%.
-    haptic_override = ai_haptic > 0.12
-    speech_gate = np.where(haptic_override, np.maximum(speech_gate, 0.70), speech_gate)
+    # NO haptic override during speech — dialogue = full silence.
+    # Previously, any frame with ai_haptic > 0.12 would force 70%
+    # pass-through, leaking vibrations into speech scenes.
+    # Now speech gate is absolute.
 
     # ── Percussive novelty gating ────────────────────────
     # Constant percussive energy (machine hum, engine) → suppress.
@@ -494,19 +495,24 @@ def _build_whisper_speech_gate(
     if not speech_segments:
         return gate
 
-    guard_dur = 0.10  # 100 ms guard on each side
+    guard_dur = 0.20  # 200 ms guard on each side (was 100 ms)
     for seg in speech_segments:
         start_s = max(0.0, seg.start - guard_dur)
         end_s = seg.end + guard_dur
         start_f = int(start_s / frame_dur)
         end_f = min(n_frames, int(end_s / frame_dur) + 1)
 
-        # Proportional suppression based on confidence
+        # Hard suppression for confident speech — full zero
         suppression = float(seg.confidence)
-        gate[start_f:end_f] = np.minimum(
-            gate[start_f:end_f],
-            1.0 - suppression,
-        )
+        if suppression > 0.5:
+            # Confident speech → gate to 0.0 (complete silence)
+            gate[start_f:end_f] = 0.0
+        else:
+            # Low-confidence speech → proportional suppression
+            gate[start_f:end_f] = np.minimum(
+                gate[start_f:end_f],
+                1.0 - suppression,
+            )
 
     return gate
 

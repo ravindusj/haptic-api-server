@@ -28,8 +28,8 @@ RUN mkdir -p /tmp/haptic-jobs/uploads /tmp/haptic-jobs/results
 # ── Pre-download YAMNet model (~18 MB, cached in image layer) ─
 RUN python -c "import tensorflow_hub as hub; model = hub.load('https://tfhub.dev/google/yamnet/1'); print('YAMNet model cached successfully')"
 
-# ── Pre-download faster-whisper tiny model (~75 MB) ──────
-RUN python -c "from faster_whisper import WhisperModel; model = WhisperModel('tiny', device='cpu', compute_type='int8'); print('faster-whisper tiny model cached successfully')"
+# ── Pre-download faster-whisper base model (~150 MB) ─────
+RUN python -c "from faster_whisper import WhisperModel; model = WhisperModel('base', device='cpu', compute_type='int8'); print('faster-whisper base model cached successfully')"
 
 # ── Pre-download MoViNet-A0 action recognition model (~20 MB) ─
 RUN python -c "import tensorflow_hub as hub; model = hub.load('https://www.kaggle.com/models/google/movinet/TensorFlow2/a0-base-kinetics-600-classification/3'); print('MoViNet-A0 model cached successfully')" || echo 'MoViNet cache skipped (will download on first use)'

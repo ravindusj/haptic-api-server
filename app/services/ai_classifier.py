@@ -317,11 +317,11 @@ def _run_whisper(wav_path: str, duration: float) -> list[SpeechSegment]:
     try:
         segments, info = whisper.transcribe(
             wav_path,
-            beam_size=1,           # fastest decoding
+            beam_size=3,           # better boundary accuracy
             vad_filter=True,       # use Silero VAD for filtering
             vad_parameters=dict(
-                min_silence_duration_ms=300,
-                speech_pad_ms=100,
+                min_silence_duration_ms=200,   # 200ms silence splits segments
+                speech_pad_ms=150,             # 150ms padding for clean edges
             ),
         )
 
@@ -372,11 +372,20 @@ def _compute_haptic_score(probs: np.ndarray) -> float:
 
 
 def _compute_speech_score(probs: np.ndarray) -> float:
-    """Aggregate probability of speech/dialogue classes."""
+    """Aggregate probability of speech/dialogue classes.
+
+    Uses the sum of the top-3 speech class probabilities (capped at 1.0)
+    instead of just the max.  This catches frames where multiple speech
+    classes share probability (e.g. 'Speech' 0.3 + 'Conversation' 0.25
+    + 'Male speech' 0.2 = 0.75), which a max-only approach would score
+    as only 0.3.
+    """
     speech_indices = [i for i in SPEECH_CLASSES.keys() if i < len(probs)]
     if not speech_indices:
         return 0.0
-    return float(np.max(probs[speech_indices]))
+    speech_probs = np.array([probs[i] for i in speech_indices])
+    top_k = min(3, len(speech_probs))
+    return float(np.clip(np.sort(speech_probs)[-top_k:].sum(), 0.0, 1.0))
 
 
 def _get_dominant_class(probs: np.ndarray) -> str:

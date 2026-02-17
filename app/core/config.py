@@ -56,7 +56,7 @@ class Settings(BaseSettings):
     YAMNET_MODEL_HANDLE: str = "https://tfhub.dev/google/yamnet/1"
 
     # ── Whisper Model ────────────────────────────────────
-    WHISPER_MODEL_SIZE: str = "tiny"      # tiny | base | small
+    WHISPER_MODEL_SIZE: str = "base"      # tiny | base | small
     WHISPER_COMPUTE_TYPE: str = "int8"    # int8 for CPU efficiency
 
     # ── Frequency Bands (Hz) ─────────────────────────────
