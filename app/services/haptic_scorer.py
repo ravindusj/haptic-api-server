@@ -203,10 +203,9 @@ def fuse_scores(
     # Hard cutoff: anything below 0.08 becomes 0.0 (full silence)
     speech_gate = np.where(speech_gate < 0.08, 0.0, speech_gate)
 
-    # NO haptic override during speech — dialogue = full silence.
-    # Previously, any frame with ai_haptic > 0.12 would force 70%
-    # pass-through, leaking vibrations into speech scenes.
-    # Now speech gate is absolute.
+    # Speech gate suppresses voice-driven vibrations, but the
+    # non-speech floor (computed later) adds back background
+    # music / bass / percussion / effects so they are still felt.
 
     # ── Percussive novelty gating ────────────────────────
     # Constant percussive energy (machine hum, engine) → suppress.
@@ -298,8 +297,39 @@ def fuse_scores(
     else:
         sharpness_mod = np.zeros(n_frames, dtype=np.float64)
 
-    # ── Apply speech gate (once only) ─────────────────────
+    # ── Apply speech gate (selective) ─────────────────────
+    # Instead of blanket-killing everything during speech, we
+    # suppress the full signal but add back a "non-speech floor"
+    # built from speech-immune components so background music,
+    # bass, drums, and sound effects are still felt.
+    #
+    # Speech-immune signals (by design):
+    #   perc_modulated  — HPSS strips harmonics; speech has no
+    #                     percussive transients.
+    #   sub_bass        — 20-60 Hz; speech fundamental is >80 Hz.
+    #   ai_haptic gated — YAMNet haptic score, zeroed when the
+    #                     frame is speech-dominant.
+    ai_speech_clip = np.clip(ai_speech, 0.0, 1.0)
+    # AI haptic only counts when frame is NOT speech-dominant
+    haptic_non_speech = ai_haptic * (1.0 - ai_speech_clip)
+
+    non_speech_floor = (
+        weights.percussive * perc_modulated
+        + weights.sub_bass * sub_bass
+        + 0.60 * weights.bass * bass         # bass partially leaks voice
+        + weights.ai * haptic_non_speech
+    )
+    # Normalise: cap at 0.50 so background never overpowers
+    _nsf_max = np.percentile(non_speech_floor, 99) if len(non_speech_floor) > 0 else 1.0
+    if _nsf_max > 1e-6:
+        non_speech_floor = np.clip(non_speech_floor / _nsf_max, 0.0, 1.0)
+    non_speech_floor *= 0.50
+
+    # Gate the full signal, then add back the non-speech floor
+    # only in regions where the gate is suppressing (< 1.0).
     combined *= speech_gate
+    suppression_region = 1.0 - speech_gate   # 0 outside speech, 1 inside
+    combined += non_speech_floor * suppression_region
 
     # ── Silence gate (raw RMS) ───────────────────────────
     raw_rms_trimmed = _pad_or_trim_np(raw_rms, n_frames)
@@ -385,8 +415,19 @@ def fuse_scores(
     sharpness_env, _ = _downsample_mean(sharpness, frame_dur, ENVELOPE_FPS)
 
     # ── Extract transient tap events ─────────────────────
-    # Boost percussive signal for tap detection
-    boosted_for_taps = _boost_array(combined) * speech_gate
+    # Boost percussive signal for tap detection.
+    # Use a relaxed speech gate for transients: allow strong
+    # percussive/haptic events through even during speech.
+    # If the frame has high percussive energy AND low speech
+    # score, it's a non-speech transient (explosion, drum hit)
+    # and should be allowed.
+    transient_speech_gate = speech_gate.copy()
+    perc_strong = perc_rms > 0.15
+    speech_weak = ai_speech < 0.4
+    transient_speech_gate[perc_strong & speech_weak] = np.maximum(
+        transient_speech_gate[perc_strong & speech_weak], 0.70
+    )
+    boosted_for_taps = _boost_array(combined) * transient_speech_gate
 
     threshold = 0.45 - (sensitivity * 0.40)
     threshold = max(0.05, threshold)
@@ -555,7 +596,13 @@ def _extract_transient_events(
         if onset[fi] < onset_gate:
             continue
         if speech_gate is not None and fi < len(speech_gate) and speech_gate[fi] < 0.1:
-            continue
+            # Still allow if strong percussive + weak speech (non-speech transient)
+            _is_nonspeech_transient = (
+                fi < len(ai_haptic) and ai_haptic[fi] > 0.3
+                and onset[fi] > 0.5
+            )
+            if not _is_nonspeech_transient:
+                continue
         t = fi * frame_dur
         if (t - last_t) < min_interval:
             continue
@@ -586,7 +633,10 @@ def _extract_transient_events(
         if speech_gate is not None:
             beat_frame = int(bt / frame_dur)
             if beat_frame < len(speech_gate) and speech_gate[beat_frame] < 0.1:
-                continue
+                # Allow strong beats through if haptic-worthy (drums, impacts)
+                _beat_haptic = ai_haptic[beat_frame] if beat_frame < len(ai_haptic) else 0.0
+                if not (bs > 0.5 and _beat_haptic > 0.2):
+                    continue
         too_close = any(abs(e.time - bt) < min_interval for e in events)
         if too_close:
             continue
