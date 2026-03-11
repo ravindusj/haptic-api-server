@@ -165,6 +165,22 @@ def fuse_scores(
     mid = np.array(dsp.mid_energy, dtype=np.float64)
     presence = np.array(dsp.presence_energy, dtype=np.float64)
 
+    # ── Per-band novelty gating ──────────────────────────
+    # Suppress constant energy in each frequency band so ambient
+    # noise (HVAC, room tone, wind, traffic) doesn't produce
+    # continuous vibration.  Only varying (interesting) content
+    # passes through.  Floor of 0.10 keeps faint musical
+    # sustains alive while killing flat drone.
+    _band_nov_win = max(3, int(1.0 / frame_dur))  # ~1 s window
+    for _band in (sub_bass, bass, low_mid, mid, presence):
+        _bnov = _rolling_std(_band, _band_nov_win)
+        _bnov_max = np.percentile(_bnov, 98) if len(_bnov) > 0 else 1.0
+        if _bnov_max > 1e-6:
+            _bnov /= _bnov_max
+        _bnov = np.clip(_bnov, 0.0, 1.0)
+        _bgate = 0.10 + 0.90 * _bnov        # range [0.10, 1.0]
+        _band[:] = _band * _bgate            # in-place modulation
+
     # ── Resample AI scores to DSP frame rate ─────────────
     ai_haptic = _resample_to_length(np.array(ai.haptic_scores), n_frames)
 
@@ -209,21 +225,33 @@ def fuse_scores(
 
     # ── Percussive novelty gating ────────────────────────
     # Constant percussive energy (machine hum, engine) → suppress.
-    # Floor raised to 0.50 so steady rhythms (drums, bass lines)
-    # retain at least half their energy instead of being killed.
+    # Floor of 0.15: steady rhythms (drums, bass lines) keep some
+    # energy, but flat drones (A/C, engine idle) are cut hard.
     novelty_win = max(3, int(0.5 / frame_dur))
     perc_nov = _rolling_std(perc_rms, novelty_win)
     perc_nmax = np.percentile(perc_nov, 98) if len(perc_nov) > 0 else 1.0
     if perc_nmax > 1e-6:
         perc_nov /= perc_nmax
     perc_nov = np.clip(perc_nov, 0.0, 1.0)
-    perc_gate = 0.50 + 0.50 * perc_nov
+    perc_gate = 0.15 + 0.85 * perc_nov              # [0.15, 1.0]
     perc_modulated = perc_rms * perc_gate
+
+    # ── Harmonic novelty gating ───────────────────────────
+    # harm_rms carries sustained tones (HPSS harmonic component).
+    # Ambient hum/drone is sustained → lands here.  Gate it so
+    # only *varying* harmonic content (melody, chord changes) passes.
+    _harm_nov = _rolling_std(harm_rms, _band_nov_win)
+    _harm_nov_max = np.percentile(_harm_nov, 98) if len(_harm_nov) > 0 else 1.0
+    if _harm_nov_max > 1e-6:
+        _harm_nov /= _harm_nov_max
+    _harm_nov = np.clip(_harm_nov, 0.0, 1.0)
+    _harm_gate = 0.10 + 0.90 * _harm_nov
+    harm_rms_gated = harm_rms * _harm_gate
 
     # ── Combine weighted signals ─────────────────────────
     # Include harmonic RMS so sustained music (strings, pads,
     # singing) drives continuous vibration — not just transients.
-    harmonic_contribution = 0.15 * harm_rms
+    harmonic_contribution = 0.15 * harm_rms_gated
 
     combined = (
         weights.percussive * perc_modulated
@@ -297,6 +325,21 @@ def fuse_scores(
     else:
         sharpness_mod = np.zeros(n_frames, dtype=np.float64)
 
+    # ── Global ambient / variance gate ────────────────────
+    # Even after per-band novelty gating, the sum of many small
+    # residuals can produce a non-trivial constant signal.  Measure
+    # the rolling variance of the *combined* signal: where it is
+    # flat (no dynamics), suppress toward zero.
+    _ambient_win = max(3, int(1.0 / frame_dur))     # ~1 s window
+    combined_var = _rolling_std(combined, _ambient_win)
+    _cvar_max = np.percentile(combined_var, 98) if len(combined_var) > 0 else 1.0
+    if _cvar_max > 1e-6:
+        combined_var /= _cvar_max
+    combined_var = np.clip(combined_var, 0.0, 1.0)
+    # Gate: ramp from 0.05 (flat signal) to 1.0 (dynamic signal)
+    ambient_gate = np.clip((combined_var - 0.02) / 0.10, 0.05, 1.0)
+    combined *= ambient_gate
+
     # ── Apply speech gate (once only) ─────────────────────
     combined *= speech_gate
 
@@ -310,20 +353,29 @@ def fuse_scores(
     envelope_signal = combined.copy()
 
     # ── Adaptive rest gate — zero out faint frames ───────
-    # Use a low fixed floor plus a fraction of the local median
-    # so quiet-but-real content isn't zeroed after normalisation.
+    # Variance-aware: use a higher ceiling so ambient residual
+    # that survived earlier gates gets caught here.
     local_median = np.median(envelope_signal[envelope_signal > 0]) if np.any(envelope_signal > 0) else 0.0
-    rest_threshold = min(0.02, max(0.010, 0.05 * local_median))
+    rest_threshold = min(0.06, max(0.015, 0.10 * local_median))
     envelope_signal[envelope_signal < rest_threshold] = 0.0
 
-    # ── Perceptual floor boost ───────────────────────────
+    # ── Perceptual floor boost (variance-conditional) ────
     # Remap non-silent frames from [0, 1] to [0.20, 1.0] so
-    # any audible content produces at least a perceptible
-    # vibration on the Taptic Engine (values < 0.2 are barely felt).
+    # audible *dynamic* content produces a perceptible vibration.
+    # BUT: only apply the 0.20 floor where the signal has real
+    # variance (ambient_gate > 0.3).  Low-variance frames keep
+    # their natural value — no artificial boost on ambient.
+    _env_var = _pad_or_trim_np(ambient_gate, len(envelope_signal))
+    _dynamic_mask = (envelope_signal > 0.01) & (_env_var > 0.30)
+    _ambient_mask = (envelope_signal > 0.01) & (_env_var <= 0.30)
     envelope_signal = np.where(
-        envelope_signal > 0.01,
-        0.20 + envelope_signal * 0.80,
-        0.0,
+        _dynamic_mask,
+        0.20 + envelope_signal * 0.80,   # full boost for dynamic
+        np.where(
+            _ambient_mask,
+            envelope_signal,              # no boost for ambient
+            0.0,                          # silence stays silent
+        ),
     )
     envelope_signal = np.clip(envelope_signal, 0.0, 1.0)
 
