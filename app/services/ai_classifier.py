@@ -50,15 +50,15 @@ HAPTIC_WORTHY_CLASSES: dict[int, tuple[str, float]] = {
     # Thunder — weight 3.0
     281: ("Thunder", 3.0),
     282: ("Thunderstorm", 3.0),
-    # Drums & percussion — weight 2.0
-    159: ("Drum", 2.0),
-    160: ("Snare drum", 2.0),
-    163: ("Bass drum", 2.0),
-    161: ("Rimshot", 2.0),
-    162: ("Drum roll", 2.0),
-    164: ("Cymbal", 1.5),
-    165: ("Hi-hat", 1.5),
-    166: ("Drum kit", 2.0),
+    # Drums & percussion — weight 0.3 (suppressed: acoustic drums self-punch)
+    159: ("Drum", 0.3),
+    160: ("Snare drum", 0.3),
+    163: ("Bass drum", 0.3),
+    161: ("Rimshot", 0.3),
+    162: ("Drum roll", 0.3),
+    164: ("Cymbal", 0.3),
+    165: ("Hi-hat", 0.3),
+    166: ("Drum kit", 0.3),
     # Bass & low-freq instruments — weight 1.5
     153: ("Bass guitar", 1.5),
     # Guitar / strings — weight 1.0

@@ -41,6 +41,7 @@ class Settings(BaseSettings):
     MIN_TRANSIENT_INTERVAL_MS: float = 50 # debounce between taps
     SILENCE_RMS_THRESHOLD: float = 0.003  # below = silence (raw RMS)
     SPEECH_SUPPRESSION_FACTOR: float = 0.05  # near-zero for dialogue
+    DRUM_SUPPRESSION_FACTOR: float = 0.15   # residual when drums dominant (0=mute, 1=pass)
 
     # ── Novelty Gate Floors ──────────────────────────────
     NOVELTY_FLOOR_PER_BAND: float = 0.03        # min pass-through for band gates

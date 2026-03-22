@@ -44,6 +44,12 @@ settings = get_settings()
 # Envelope sample rate – one control point every 50 ms.
 ENVELOPE_FPS: float = 20.0
 
+# Acoustic drum labels — suppressed because drums self-punch through audio.
+_DRUM_LABELS_SET: set[str] = {
+    "Drum", "Snare drum", "Bass drum", "Rimshot",
+    "Drum roll", "Cymbal", "Hi-hat", "Drum kit",
+}
+
 
 @dataclass
 class ScoringWeights:
@@ -303,13 +309,19 @@ def fuse_scores(
     # ── Impact amplification ─────────────────────────────
     # When percussive + bass are both strong → genuine impact.
     # Boost by up to 2.5× so explosions/hits feel powerful.
+    # Skip for acoustic drums — they self-punch through audio.
+    is_drum_frame = np.array([lbl in _DRUM_LABELS_SET for lbl in dsp_dominant])
     impact_factor = np.where(
-        (perc_rms > 0.06) & (bass > 0.06),
+        (perc_rms > 0.06) & (bass > 0.06) & (~is_drum_frame),
         1.0 + 1.5 * perc_rms * bass,
         1.0,
     )
     # Percussive-only boost for crashes that lack strong bass
-    perc_only_boost = np.where(perc_rms > 0.20, 1.0 + 0.8 * perc_rms, 1.0)
+    perc_only_boost = np.where(
+        (perc_rms > 0.20) & (~is_drum_frame),
+        1.0 + 0.8 * perc_rms,
+        1.0,
+    )
     combined *= impact_factor * perc_only_boost
 
     # ── Scenario-specific modulation from video actions ──
@@ -360,6 +372,14 @@ def fuse_scores(
 
     # ── Apply speech gate (once only) ─────────────────────
     combined *= speech_gate
+
+    # ── Drum suppression gate ─────────────────────────────
+    # Acoustic drums already provide natural "kick" through audio.
+    # Suppress haptic signal when YAMNet detects drums as dominant.
+    drum_mask = is_drum_frame.astype(np.float64)
+    drum_gate = 1.0 - drum_mask * (1.0 - settings.DRUM_SUPPRESSION_FACTOR)
+    drum_gate = _smooth(drum_gate, max(1, int(0.08 / frame_dur)))
+    combined *= drum_gate
 
     # ── Silence gate (raw RMS) ───────────────────────────
     raw_rms_trimmed = _pad_or_trim_np(raw_rms, n_frames)
@@ -432,10 +452,7 @@ def fuse_scores(
         "Slap, smack", "Artillery fire",
     }
     _GUNSHOT_LABELS = {"Gunshot, gunfire", "Machine gun", "Fusillade"}
-    _DRUM_LABELS = {
-        "Drum", "Snare drum", "Bass drum", "Rimshot",
-        "Drum roll", "Cymbal", "Hi-hat", "Drum kit",
-    }
+    _DRUM_LABELS = _DRUM_LABELS_SET
     _DEEP_LABELS = {
         "Bass guitar", "Double bass", "Engine",
         "Motor vehicle (road)", "Truck",
@@ -635,6 +652,9 @@ def _extract_transient_events(
             continue
         if speech_gate is not None and fi < len(speech_gate) and speech_gate[fi] < 0.1:
             continue
+        # Skip drum-dominated frames — drums self-punch through audio
+        if dsp_dominant is not None and fi < len(dsp_dominant) and dsp_dominant[fi] in _DRUM_LABELS_SET:
+            continue
         t = fi * frame_dur
         if (t - last_t) < min_interval:
             continue
@@ -662,10 +682,13 @@ def _extract_transient_events(
     for bt, bs in zip(beat_times, beat_strengths):
         if bs < 0.12:
             continue
+        beat_frame = int(bt / frame_dur)
         if speech_gate is not None:
-            beat_frame = int(bt / frame_dur)
             if beat_frame < len(speech_gate) and speech_gate[beat_frame] < 0.1:
                 continue
+        # Skip beats on drum-dominant frames
+        if dsp_dominant is not None and beat_frame < len(dsp_dominant) and dsp_dominant[beat_frame] in _DRUM_LABELS_SET:
+            continue
         too_close = any(abs(e.time - bt) < min_interval for e in events)
         if too_close:
             continue
