@@ -50,6 +50,13 @@ _DRUM_LABELS_SET: set[str] = {
     "Drum roll", "Cymbal", "Hi-hat", "Drum kit",
 }
 
+# Impact labels — these always override speech suppression during dialogue.
+_IMPACT_LABELS_SET: set[str] = {
+    "Explosion", "Gunshot, gunfire", "Machine gun", "Fusillade",
+    "Artillery fire", "Smash, crash", "Thump, thud", "Bang",
+    "Whack, thwack", "Slap, smack", "Thunder", "Thunderstorm",
+}
+
 
 @dataclass
 class ScoringWeights:
@@ -225,10 +232,16 @@ def fuse_scores(
     speech_gate = np.where(speech_gate < 0.05, 0.0, speech_gate)
 
     # ── Haptic-content override ──────────────────────────
-    # If YAMNet detects strong haptic content (crash, music, etc.),
-    # do NOT let the speech gate kill it — guarantee at least 70%.
-    haptic_override = ai_haptic > 0.12
-    speech_gate = np.where(haptic_override, np.maximum(speech_gate, 0.70), speech_gate)
+    # Impact classes (explosions, gunshots, crashes) always override
+    # speech suppression so they vibrate through dialogue.  Score-based
+    # threshold is a fallback for unlabeled but strong impacts.
+    _is_impact_frame = np.array([lbl in _IMPACT_LABELS_SET for lbl in dsp_dominant])
+    haptic_override = _is_impact_frame | (ai_haptic > settings.HAPTIC_OVERRIDE_THRESHOLD)
+    speech_gate = np.where(
+        haptic_override,
+        np.maximum(speech_gate, settings.HAPTIC_OVERRIDE_PASS_THROUGH),
+        speech_gate,
+    )
 
     # ── Percussive novelty gating ────────────────────────
     # Constant percussive energy (machine hum, engine) → suppress.
@@ -409,8 +422,12 @@ def fuse_scores(
     if _psv_max > 1e-6:
         _post_speech_var /= _psv_max
     _env_var = np.clip(_post_speech_var, 0.0, 1.0)
-    _dynamic_mask = (envelope_signal > 0.01) & (_env_var > 0.30)
-    _ambient_mask = (envelope_signal > 0.01) & (_env_var <= 0.30)
+    # Exclude speech-suppressed frames from the perceptual floor boost.
+    # Speech residual has variance (dynamic audio), but should NOT be
+    # re-boosted after suppression — that defeats dialogue silencing.
+    _speech_suppressed = _pad_or_trim_np(speech_gate, len(envelope_signal)) < 0.30
+    _dynamic_mask = (envelope_signal > 0.01) & (_env_var > 0.30) & (~_speech_suppressed)
+    _ambient_mask = (envelope_signal > 0.01) & (~_dynamic_mask)
     envelope_signal = np.where(
         _dynamic_mask,
         0.20 + envelope_signal * 0.80,   # full boost for dynamic
