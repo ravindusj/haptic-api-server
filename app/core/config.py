@@ -41,6 +41,20 @@ class Settings(BaseSettings):
     MIN_TRANSIENT_INTERVAL_MS: float = 50 # debounce between taps
     SILENCE_RMS_THRESHOLD: float = 0.003  # below = silence (raw RMS)
     SPEECH_SUPPRESSION_FACTOR: float = 0.05  # near-zero for dialogue
+
+    # ── Novelty Gate Floors ──────────────────────────────
+    NOVELTY_FLOOR_PER_BAND: float = 0.03        # min pass-through for band gates
+    NOVELTY_FLOOR_PERCUSSIVE: float = 0.05      # min pass-through for percussive gate
+    NOVELTY_FLOOR_HARMONIC: float = 0.03        # min pass-through for harmonic gate
+    NOVELTY_FLOOR_GLOBAL_AMBIENT: float = 0.02  # min pass-through for global ambient gate
+
+    # ── AI Activity Gate ─────────────────────────────────
+    AI_ACTIVITY_GATE_FLOOR: float = 0.08        # min pass-through when AI detects no haptic content
+    AI_ACTIVITY_GATE_THRESHOLD: float = 0.05    # haptic_score below this = "inactive"
+
+    # ── Post-Boost Rest Gate ─────────────────────────────
+    POST_BOOST_REST_THRESHOLD: float = 0.18     # non-dynamic frames below this after boost → zero
+
     MAX_AHAP_EVENTS_PER_CHUNK: int = 128  # Apple limit per pattern
     AHAP_CHUNK_DURATION_S: float = 30.0   # Apple limit per pattern
 

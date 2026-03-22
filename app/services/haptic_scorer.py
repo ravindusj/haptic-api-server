@@ -178,7 +178,8 @@ def fuse_scores(
         if _bnov_max > 1e-6:
             _bnov /= _bnov_max
         _bnov = np.clip(_bnov, 0.0, 1.0)
-        _bgate = 0.10 + 0.90 * _bnov        # range [0.10, 1.0]
+        _floor = settings.NOVELTY_FLOOR_PER_BAND
+        _bgate = _floor + (1.0 - _floor) * _bnov  # range [floor, 1.0]
         _band[:] = _band * _bgate            # in-place modulation
 
     # ── Resample AI scores to DSP frame rate ─────────────
@@ -233,7 +234,8 @@ def fuse_scores(
     if perc_nmax > 1e-6:
         perc_nov /= perc_nmax
     perc_nov = np.clip(perc_nov, 0.0, 1.0)
-    perc_gate = 0.15 + 0.85 * perc_nov              # [0.15, 1.0]
+    _pf = settings.NOVELTY_FLOOR_PERCUSSIVE
+    perc_gate = _pf + (1.0 - _pf) * perc_nov        # [floor, 1.0]
     perc_modulated = perc_rms * perc_gate
 
     # ── Harmonic novelty gating ───────────────────────────
@@ -245,7 +247,8 @@ def fuse_scores(
     if _harm_nov_max > 1e-6:
         _harm_nov /= _harm_nov_max
     _harm_nov = np.clip(_harm_nov, 0.0, 1.0)
-    _harm_gate = 0.10 + 0.90 * _harm_nov
+    _hf = settings.NOVELTY_FLOOR_HARMONIC
+    _harm_gate = _hf + (1.0 - _hf) * _harm_nov
     harm_rms_gated = harm_rms * _harm_gate
 
     # ── Combine weighted signals ─────────────────────────
@@ -337,8 +340,23 @@ def fuse_scores(
         combined_var /= _cvar_max
     combined_var = np.clip(combined_var, 0.0, 1.0)
     # Gate: ramp from 0.05 (flat signal) to 1.0 (dynamic signal)
-    ambient_gate = np.clip((combined_var - 0.02) / 0.10, 0.05, 1.0)
+    ambient_gate = np.clip((combined_var - 0.02) / 0.10, settings.NOVELTY_FLOOR_GLOBAL_AMBIENT, 1.0)
     combined *= ambient_gate
+
+    # ── AI activity gate ──────────────────────────────────
+    # When YAMNet classifies nothing haptic-worthy (wind, silence,
+    # white noise, room tone), suppress the DSP-derived continuous
+    # signal.  Only semantically meaningful content passes fully.
+    _ai_activity = _pad_or_trim_np(ai_haptic, n_frames)
+    _ai_active = _ai_activity > settings.AI_ACTIVITY_GATE_THRESHOLD
+    _ai_active_smooth = _smooth(
+        _ai_active.astype(np.float64), max(1, int(0.2 / frame_dur))
+    )
+    _ai_gate = (
+        settings.AI_ACTIVITY_GATE_FLOOR
+        + (1.0 - settings.AI_ACTIVITY_GATE_FLOOR) * _ai_active_smooth
+    )
+    combined *= _ai_gate
 
     # ── Apply speech gate (once only) ─────────────────────
     combined *= speech_gate
@@ -362,10 +380,15 @@ def fuse_scores(
     # ── Perceptual floor boost (variance-conditional) ────
     # Remap non-silent frames from [0, 1] to [0.20, 1.0] so
     # audible *dynamic* content produces a perceptible vibration.
-    # BUT: only apply the 0.20 floor where the signal has real
-    # variance (ambient_gate > 0.3).  Low-variance frames keep
-    # their natural value — no artificial boost on ambient.
-    _env_var = _pad_or_trim_np(ambient_gate, len(envelope_signal))
+    # BUT: only apply the 0.20 floor where the *post-speech* signal
+    # has real variance.  Using pre-speech ambient_gate would
+    # incorrectly boost speech-suppressed frames (speech is dynamic
+    # audio, so ambient_gate > 0.30 during dialogue).
+    _post_speech_var = _rolling_std(envelope_signal, max(3, int(1.0 / frame_dur)))
+    _psv_max = np.percentile(_post_speech_var, 98) if len(_post_speech_var) > 0 else 1.0
+    if _psv_max > 1e-6:
+        _post_speech_var /= _psv_max
+    _env_var = np.clip(_post_speech_var, 0.0, 1.0)
     _dynamic_mask = (envelope_signal > 0.01) & (_env_var > 0.30)
     _ambient_mask = (envelope_signal > 0.01) & (_env_var <= 0.30)
     envelope_signal = np.where(
@@ -378,6 +401,16 @@ def fuse_scores(
         ),
     )
     envelope_signal = np.clip(envelope_signal, 0.0, 1.0)
+
+    # ── Post-boost rest gate ──────────────────────────────
+    # Non-dynamic frames that survived the boost stage with low
+    # residual intensity are ambient artifacts — zero them out.
+    _non_dynamic_low = (
+        (~_dynamic_mask)
+        & (envelope_signal > 0.0)
+        & (envelope_signal < settings.POST_BOOST_REST_THRESHOLD)
+    )
+    envelope_signal[_non_dynamic_low] = 0.0
 
     # ── Build sharpness from band balance ────────────────
     # Sub-bass heavy → low sharpness, presence/brilliance → high.
