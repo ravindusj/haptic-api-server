@@ -49,10 +49,10 @@ class Settings(BaseSettings):
     NOVELTY_FLOOR_PER_BAND: float = 0.03        # min pass-through for band gates
     NOVELTY_FLOOR_PERCUSSIVE: float = 0.05      # min pass-through for percussive gate
     NOVELTY_FLOOR_HARMONIC: float = 0.03        # min pass-through for harmonic gate
-    NOVELTY_FLOOR_GLOBAL_AMBIENT: float = 0.02  # min pass-through for global ambient gate
+    NOVELTY_FLOOR_GLOBAL_AMBIENT: float = 0.10  # min pass-through for global ambient gate
 
     # ── AI Activity Gate ─────────────────────────────────
-    AI_ACTIVITY_GATE_FLOOR: float = 0.08        # min pass-through when AI detects no haptic content
+    AI_ACTIVITY_GATE_FLOOR: float = 0.15        # min pass-through when AI detects no haptic content
     AI_ACTIVITY_GATE_THRESHOLD: float = 0.05    # haptic_score below this = "inactive"
 
     # ── Post-Boost Rest Gate ─────────────────────────────

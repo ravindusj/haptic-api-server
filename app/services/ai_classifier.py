@@ -218,7 +218,7 @@ def classify_audio(wav_path: str) -> AIClassification:
     # ── YAMNet classification ────────────────────────────
     yamnet = _load_yamnet()
     if yamnet is not None:
-        haptic_scores, speech_scores, dominant_classes = _run_yamnet(
+        haptic_scores, speech_scores, drum_scores, dominant_classes = _run_yamnet(
             yamnet, y, sr, duration,
         )
     else:
@@ -226,6 +226,7 @@ def classify_audio(wav_path: str) -> AIClassification:
         n_frames = max(1, int(duration / 0.48))
         haptic_scores = [0.0] * n_frames
         speech_scores = [0.0] * n_frames
+        drum_scores = [0.0] * n_frames
         dominant_classes = ["unknown"] * n_frames
 
     # ── Whisper speech detection ─────────────────────────
@@ -248,6 +249,7 @@ def classify_audio(wav_path: str) -> AIClassification:
         total_frames=len(haptic_scores),
         haptic_scores=haptic_scores,
         speech_scores=speech_scores,
+        drum_scores=drum_scores,
         dominant_classes=dominant_classes,
         speech_segments=speech_segments,
     )
@@ -261,7 +263,7 @@ def _run_yamnet(
     waveform: np.ndarray,
     sr: int,
     duration: float,
-) -> tuple[list[float], list[float], list[str]]:
+) -> tuple[list[float], list[float], list[float], list[str]]:
     """Run YAMNet on the full waveform.
 
     YAMNet internally windows at 0.96 s with 0.48 s hop,
@@ -281,15 +283,18 @@ def _run_yamnet(
 
     haptic_scores: list[float] = []
     speech_scores: list[float] = []
+    drum_scores: list[float] = []
     dominant_classes: list[str] = []
 
     for frame_scores in scores_np:
         h = _compute_haptic_score(frame_scores)
         s = _compute_speech_score(frame_scores)
+        d = _compute_drum_score(frame_scores)
         top = _get_dominant_class(frame_scores)
 
         haptic_scores.append(round(float(h), 4))
         speech_scores.append(round(float(s), 4))
+        drum_scores.append(round(float(d), 4))
         dominant_classes.append(top)
 
     # ── Temporal smoothing ───────────────────────────────
@@ -297,12 +302,13 @@ def _run_yamnet(
     # while removing single-frame noise jitter.
     haptic_scores = _ema_smooth(haptic_scores, alpha=0.3)
     speech_scores = _ema_smooth(speech_scores, alpha=0.3)
+    drum_scores = _ema_smooth(drum_scores, alpha=0.3)
 
     # Majority-vote median filter on dominant class labels (window=3):
     # kills single-frame class flips like explosion→music→explosion.
     dominant_classes = _median_filter_labels(dominant_classes, window=3)
 
-    return haptic_scores, speech_scores, dominant_classes
+    return haptic_scores, speech_scores, drum_scores, dominant_classes
 
 
 # ── Whisper speech detection ─────────────────────────────
@@ -369,6 +375,17 @@ def _compute_haptic_score(probs: np.ndarray) -> float:
     ])
     top_k = min(5, len(weighted_probs))
     return float(np.clip(np.sort(weighted_probs)[-top_k:].sum(), 0.0, 1.0))
+
+
+_DRUM_INDICES: set[int] = {159, 160, 161, 162, 163, 164, 165, 166}
+
+
+def _compute_drum_score(probs: np.ndarray) -> float:
+    """Aggregate probability of drum/percussion classes."""
+    drum_indices = [i for i in _DRUM_INDICES if i < len(probs)]
+    if not drum_indices:
+        return 0.0
+    return float(np.max(probs[drum_indices]))
 
 
 def _compute_speech_score(probs: np.ndarray) -> float:

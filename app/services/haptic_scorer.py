@@ -223,13 +223,20 @@ def fuse_scores(
     # Merge with YAMNet speech scores as a backup
     ai_speech = _resample_to_length(np.array(ai.speech_scores), n_frames)
     yamnet_gate = 1.0 - np.clip((ai_speech - 0.5) / 0.4, 0.0, 1.0)
-    # Take the more suppressive of the two gates
-    speech_gate = np.minimum(speech_gate, yamnet_gate)
+    # Only use YAMNet backup where Whisper found NO speech (gate == 1.0).
+    # Where Whisper already set a suppression value, trust its precise timing
+    # over YAMNet's coarse 0.48s frames which bleed across boundaries.
+    _whisper_has_speech = speech_gate < 0.95
+    speech_gate = np.where(
+        _whisper_has_speech,
+        speech_gate,                          # Whisper active -> trust it
+        np.minimum(speech_gate, yamnet_gate), # Whisper silent -> use YAMNet backup
+    )
 
     # Smooth gate edges (~80 ms crossfade)
     gate_smooth = max(1, int(0.08 / frame_dur))
     speech_gate = _smooth(speech_gate, gate_smooth)
-    speech_gate = np.where(speech_gate < 0.05, 0.0, speech_gate)
+    speech_gate = np.where(speech_gate < 0.02, 0.0, speech_gate)
 
     # ── Haptic-content override ──────────────────────────
     # Impact classes (explosions, gunshots, crashes) always override
@@ -323,7 +330,15 @@ def fuse_scores(
     # When percussive + bass are both strong → genuine impact.
     # Boost by up to 2.5× so explosions/hits feel powerful.
     # Skip for acoustic drums — they self-punch through audio.
-    is_drum_frame = np.array([lbl in _DRUM_LABELS_SET for lbl in dsp_dominant])
+    # Detect drums via YAMNet per-class probabilities (not just dominant label).
+    # Drum-heavy music often has dominant class "Music" or "Rock music",
+    # but drum class probabilities are still high.
+    _drum_label_match = np.array([lbl in _DRUM_LABELS_SET for lbl in dsp_dominant])
+    if ai.drum_scores:
+        _drum_prob = _resample_to_length(np.array(ai.drum_scores), n_frames)
+        is_drum_frame = _drum_label_match | (_drum_prob > 0.15)
+    else:
+        is_drum_frame = _drum_label_match
     impact_factor = np.where(
         (perc_rms > 0.06) & (bass > 0.06) & (~is_drum_frame),
         1.0 + 1.5 * perc_rms * bass,
@@ -358,7 +373,7 @@ def fuse_scores(
     # residuals can produce a non-trivial constant signal.  Measure
     # the rolling variance of the *combined* signal: where it is
     # flat (no dynamics), suppress toward zero.
-    _ambient_win = max(3, int(1.0 / frame_dur))     # ~1 s window
+    _ambient_win = max(3, int(0.5 / frame_dur))     # ~0.5 s window (faster reaction)
     combined_var = _rolling_std(combined, _ambient_win)
     _cvar_max = np.percentile(combined_var, 98) if len(combined_var) > 0 else 1.0
     if _cvar_max > 1e-6:
@@ -375,7 +390,7 @@ def fuse_scores(
     _ai_activity = _pad_or_trim_np(ai_haptic, n_frames)
     _ai_active = _ai_activity > settings.AI_ACTIVITY_GATE_THRESHOLD
     _ai_active_smooth = _smooth(
-        _ai_active.astype(np.float64), max(1, int(0.2 / frame_dur))
+        _ai_active.astype(np.float64), max(1, int(0.1 / frame_dur))
     )
     _ai_gate = (
         settings.AI_ACTIVITY_GATE_FLOOR
@@ -393,6 +408,21 @@ def fuse_scores(
     drum_gate = 1.0 - drum_mask * (1.0 - settings.DRUM_SUPPRESSION_FACTOR)
     drum_gate = _smooth(drum_gate, max(1, int(0.08 / frame_dur)))
     combined *= drum_gate
+
+    # ── Music genre suppression gate ─────────────────────
+    # Drum-heavy music often gets dominant class "Music" / "Rock music",
+    # bypassing the drum gate.  Apply moderate suppression to all
+    # music-genre frames so they produce noticeably less vibration
+    # than action/impacts but still some feedback.
+    _MUSIC_LABELS_SET = {
+        "Music", "Rock music", "Pop music", "Hip hop music",
+        "Heavy metal", "Punk rock", "Disco", "Electronic music", "Techno",
+    }
+    is_music_frame = np.array([lbl in _MUSIC_LABELS_SET for lbl in dsp_dominant])
+    music_suppression = 0.40  # 40% pass-through for music
+    music_gate = 1.0 - is_music_frame.astype(np.float64) * (1.0 - music_suppression)
+    music_gate = _smooth(music_gate, max(1, int(0.08 / frame_dur)))
+    combined *= music_gate
 
     # ── Silence gate (raw RMS) ───────────────────────────
     raw_rms_trimmed = _pad_or_trim_np(raw_rms, n_frames)
@@ -425,7 +455,7 @@ def fuse_scores(
     # Exclude speech-suppressed frames from the perceptual floor boost.
     # Speech residual has variance (dynamic audio), but should NOT be
     # re-boosted after suppression — that defeats dialogue silencing.
-    _speech_suppressed = _pad_or_trim_np(speech_gate, len(envelope_signal)) < 0.30
+    _speech_suppressed = _pad_or_trim_np(speech_gate, len(envelope_signal)) < 0.15
     _dynamic_mask = (envelope_signal > 0.01) & (_env_var > 0.30) & (~_speech_suppressed)
     _ambient_mask = (envelope_signal > 0.01) & (~_dynamic_mask)
     envelope_signal = np.where(
@@ -504,7 +534,7 @@ def fuse_scores(
 
     # ── Extract transient tap events ─────────────────────
     # Boost percussive signal for tap detection
-    boosted_for_taps = _boost_array(combined) * speech_gate
+    boosted_for_taps = _boost_array(combined)
 
     threshold = 0.45 - (sensitivity * 0.40)
     threshold = max(0.05, threshold)
@@ -613,10 +643,11 @@ def _build_whisper_speech_gate(
     if not speech_segments:
         return gate
 
-    guard_dur = 0.10  # 100 ms guard on each side
+    guard_pre = 0.10   # 100 ms guard before speech starts
+    guard_post = 0.04  # 40 ms guard after speech ends
     for seg in speech_segments:
-        start_s = max(0.0, seg.start - guard_dur)
-        end_s = seg.end + guard_dur
+        start_s = max(0.0, seg.start - guard_pre)
+        end_s = seg.end + guard_post
         start_f = int(start_s / frame_dur)
         end_f = min(n_frames, int(end_s / frame_dur) + 1)
 
@@ -668,7 +699,8 @@ def _extract_transient_events(
         if onset[fi] < onset_gate:
             continue
         if speech_gate is not None and fi < len(speech_gate) and speech_gate[fi] < 0.1:
-            continue
+            if onset[fi] < 0.60:  # allow very strong onsets at speech boundary
+                continue
         # Skip drum-dominated frames — drums self-punch through audio
         if dsp_dominant is not None and fi < len(dsp_dominant) and dsp_dominant[fi] in _DRUM_LABELS_SET:
             continue
@@ -702,7 +734,8 @@ def _extract_transient_events(
         beat_frame = int(bt / frame_dur)
         if speech_gate is not None:
             if beat_frame < len(speech_gate) and speech_gate[beat_frame] < 0.1:
-                continue
+                if bs < 0.50:  # allow very strong beats at speech boundary
+                    continue
         # Skip beats on drum-dominant frames
         if dsp_dominant is not None and beat_frame < len(dsp_dominant) and dsp_dominant[beat_frame] in _DRUM_LABELS_SET:
             continue

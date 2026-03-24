@@ -148,6 +148,7 @@ class AIClassification(BaseModel):
 
     haptic_scores: list[float]         # 0-1, how haptic-worthy
     speech_scores: list[float]         # 0-1, speech probability
+    drum_scores: list[float] = []     # 0-1, drum/percussion probability
     dominant_classes: list[str]        # top class label per frame
 
     # Whisper-detected speech segments (precise timestamps)
