@@ -352,6 +352,25 @@ def fuse_scores(
     )
     combined *= impact_factor * perc_only_boost
 
+    # ── Gunshot-specific amplification ──────────────────
+    # When YAMNet detects gunshot/weapon classes, apply extra boost
+    # on top of the generic impact amplification for punchier feel.
+    _GUNSHOT_LABELS_SET = {"Gunshot, gunfire", "Machine gun", "Fusillade", "Artillery fire"}
+    _is_gunshot = np.array([lbl in _GUNSHOT_LABELS_SET for lbl in dsp_dominant])
+    gunshot_boost = np.where(_is_gunshot, 1.5, 1.0)
+    combined *= gunshot_boost
+
+    # ── Machine gun cadence modulation ──────────────────
+    # Overlay rapid 9 Hz pulsing during sustained automatic fire
+    # for a distinctive rapid-fire vibration feel.
+    _is_machinegun = np.array([lbl == "Machine gun" for lbl in dsp_dominant])
+    if np.any(_is_machinegun):
+        _mg_rate = 9.0  # Hz (simulates rate of fire)
+        _t_arr = np.arange(n_frames) * frame_dur
+        _mg_pulse = 0.5 + 0.5 * np.sin(2.0 * np.pi * _mg_rate * _t_arr)
+        _mg_mod = np.where(_is_machinegun, 0.7 + 0.3 * _mg_pulse, 1.0)
+        combined *= _mg_mod
+
     # ── Scenario-specific modulation from video actions ──
     # Each detected action scenario applies a distinct pattern
     # to the haptic signal for differentiated feel.
@@ -396,7 +415,13 @@ def fuse_scores(
         settings.AI_ACTIVITY_GATE_FLOOR
         + (1.0 - settings.AI_ACTIVITY_GATE_FLOOR) * _ai_active_smooth
     )
-    combined *= _ai_gate
+    # Bypass AI activity gate for impact frames — gunshots/explosions
+    # should not be suppressed just because YAMNet's overall activity is low.
+    _impact_bypass = _pad_or_trim_np(
+        haptic_override.astype(np.float64), n_frames
+    )
+    _ai_gate_with_bypass = np.maximum(_ai_gate, _impact_bypass)
+    combined *= _ai_gate_with_bypass
 
     # ── Apply speech gate (once only) ─────────────────────
     combined *= speech_gate
@@ -764,9 +789,9 @@ def _extract_transient_events(
         "Fusillade", "Artillery fire", "Thump, thud",
         "Whack, thwack", "Slap, smack",
     }
+    _RAPID_FIRE_CLASSES = {"Machine gun", "Fusillade", "Artillery fire"}
     if ai_haptic is not None and dsp_dominant is not None:
         burst_spacing = 0.030     # 30 ms between burst taps
-        burst_cooldown = 0.50     # max one burst per 500 ms
         last_burst_t = -1.0
         burst_sharpness = [0.95, 0.60, 0.25]  # sharp→medium→deep
         for fi in range(n_frames):
@@ -777,7 +802,9 @@ def _extract_transient_events(
             if dsp_dominant[fi] not in _BURST_CLASSES:
                 continue
             t = fi * frame_dur
-            if (t - last_burst_t) < burst_cooldown:
+            # Rapid fire classes get shorter cooldown for sustained burst feel
+            _cooldown = 0.12 if dsp_dominant[fi] in _RAPID_FIRE_CLASSES else 0.50
+            if (t - last_burst_t) < _cooldown:
                 continue
             for b in range(3):
                 bt = t + b * burst_spacing

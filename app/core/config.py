@@ -42,8 +42,8 @@ class Settings(BaseSettings):
     SILENCE_RMS_THRESHOLD: float = 0.003  # below = silence (raw RMS)
     SPEECH_SUPPRESSION_FACTOR: float = 0.05  # near-zero for dialogue
     DRUM_SUPPRESSION_FACTOR: float = 0.15   # residual when drums dominant (0=mute, 1=pass)
-    HAPTIC_OVERRIDE_THRESHOLD: float = 0.40    # ai_haptic must exceed this to override speech gate
-    HAPTIC_OVERRIDE_PASS_THROUGH: float = 0.50 # max speech_gate value during override
+    HAPTIC_OVERRIDE_THRESHOLD: float = 0.30    # ai_haptic must exceed this to override speech gate
+    HAPTIC_OVERRIDE_PASS_THROUGH: float = 0.75 # max speech_gate value during override
 
     # ── Novelty Gate Floors ──────────────────────────────
     NOVELTY_FLOOR_PER_BAND: float = 0.03        # min pass-through for band gates
