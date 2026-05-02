@@ -86,6 +86,9 @@ class Settings(BaseSettings):
         "brilliance": (4000, 8000),
     }
 
+    # ── Authentication ─────────────────────────────────────
+    API_KEY: str | None = None  # Set via .env; None/empty = auth disabled
+
     # ── AWS (optional, for S3 storage) ───────────────────
     AWS_ACCESS_KEY_ID: str | None = None
     AWS_SECRET_ACCESS_KEY: str | None = None

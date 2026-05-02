@@ -8,9 +8,10 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import APIRouter, File, HTTPException, Query, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 
+from app.core.auth import verify_api_key
 from app.core.celery_app import analyze_video_task, get_job_status, _set_job_status
 from app.core.config import get_settings
 from app.models.schemas import (
@@ -35,6 +36,7 @@ router = APIRouter(prefix=settings.API_V1_PREFIX, tags=["haptic"])
     "/analyze",
     response_model=JobCreatedResponse,
     status_code=202,
+    dependencies=[Depends(verify_api_key)],
     summary="Upload a video for haptic analysis",
     description=(
         "Upload a video file (MP4, MOV, MKV, etc.) and receive a job_id. "
@@ -127,6 +129,7 @@ async def analyze_video(
 @router.get(
     "/status/{job_id}",
     response_model=JobStatusResponse,
+    dependencies=[Depends(verify_api_key)],
     summary="Check job processing status",
 )
 async def get_status(job_id: str) -> JobStatusResponse:
@@ -152,6 +155,7 @@ async def get_status(job_id: str) -> JobStatusResponse:
 
 @router.get(
     "/result/{job_id}",
+    dependencies=[Depends(verify_api_key)],
     summary="Download the generated AHAP file",
     description="Returns the .ahap file once processing is complete.",
 )
@@ -185,6 +189,7 @@ async def download_result(job_id: str):
 @router.get(
     "/result/{job_id}/info",
     response_model=AHAPDownloadInfo,
+    dependencies=[Depends(verify_api_key)],
     summary="Get AHAP file metadata without downloading",
 )
 async def result_info(job_id: str) -> AHAPDownloadInfo:
@@ -211,6 +216,7 @@ async def result_info(job_id: str) -> AHAPDownloadInfo:
 
 @router.get(
     "/preview/{job_id}",
+    dependencies=[Depends(verify_api_key)],
     summary="Preview haptic timeline as JSON",
     description=(
         "Returns a lightweight timeline visualization showing "
@@ -280,6 +286,7 @@ async def preview_timeline(job_id: str):
 
 @router.get(
     "/visualize/{job_id}",
+    dependencies=[Depends(verify_api_key)],
     summary="Visualize haptic vs audio analysis comparison graph",
     description=(
         "Returns a PNG image with 5 panels comparing the audio analysis "
