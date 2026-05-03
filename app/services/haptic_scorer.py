@@ -57,6 +57,58 @@ _IMPACT_LABELS_SET: set[str] = {
     "Whack, thwack", "Slap, smack", "Thunder", "Thunderstorm",
 }
 
+# Per-class impact authoring template. Each template is a dict with:
+#   "taps":   list[tuple[offset_ms, intensity_scale, sharpness]]
+#   "pre":    optional tuple(offset_ms, intensity_scale, sharpness) — emitted BEFORE t
+#   "tail":   optional tuple(duration_s, peak_intensity, decay_tau_s, sharpness)
+# offset_ms is relative to the impact frame time t. intensity_scale is
+# multiplied by the per-frame base intensity. sharpness is absolute.
+_IMPACT_TEMPLATES: dict[str, dict] = {
+    "Explosion": {
+        "taps":  [(0, 1.00, 0.95), (30, 0.75, 0.80),
+                  (65, 0.50, 0.55), (110, 0.30, 0.30), (160, 0.15, 0.15)],
+        "pre":   (180, 0.30, 0.40),
+        "tail":  (1.20, 0.55, 0.45, 0.15),
+    },
+    "Thunder": {
+        "taps":  [(0, 1.00, 0.70), (45, 0.60, 0.45), (105, 0.35, 0.20)],
+        "tail":  (1.80, 0.50, 0.65, 0.10),
+    },
+    "Thunderstorm": {
+        "taps":  [(0, 1.00, 0.70), (45, 0.60, 0.45), (105, 0.35, 0.20)],
+        "tail":  (1.80, 0.50, 0.65, 0.10),
+    },
+    "Gunshot, gunfire": {
+        "taps":  [(0, 1.00, 1.00), (15, 0.55, 0.85)],
+    },
+    "Machine gun":   {"taps": [(0, 1.00, 0.95)]},
+    "Fusillade":     {"taps": [(0, 1.00, 0.95)]},
+    "Artillery fire": {
+        "taps":  [(0, 1.00, 0.85), (35, 0.70, 0.65), (80, 0.45, 0.40)],
+        "tail":  (1.00, 0.55, 0.40, 0.15),
+    },
+    "Smash, crash": {
+        "taps":  [(0, 1.00, 0.95), (28, 0.75, 0.90), (60, 0.55, 0.85),
+                  (100, 0.40, 0.75), (150, 0.25, 0.55), (210, 0.15, 0.35),
+                  (280, 0.08, 0.20)],
+        "pre":   (120, 0.20, 0.50),
+    },
+    "Bang": {
+        "taps":  [(0, 1.00, 0.85), (40, 0.50, 0.55), (95, 0.20, 0.25)],
+        "tail":  (0.45, 0.35, 0.25, 0.20),
+    },
+    "Thump, thud": {
+        "taps":  [(0, 1.00, 0.55), (50, 0.45, 0.30)],
+        "tail":  (0.55, 0.40, 0.25, 0.10),
+    },
+    "Whack, thwack": {"taps": [(0, 1.00, 0.85), (28, 0.45, 0.65)]},
+    "Slap, smack":   {"taps": [(0, 1.00, 0.80), (25, 0.40, 0.60)]},
+}
+
+_IMPACT_TEMPLATE_DEFAULT: dict = {
+    "taps": [(0, 1.00, 0.95), (30, 0.70, 0.60), (60, 0.40, 0.25)],
+}
+
 
 @dataclass
 class ScoringWeights:
@@ -570,6 +622,68 @@ def fuse_scores(
     if np.any(sharpness_mod != 0):
         sharpness = np.clip(sharpness + 0.55 * sharpness_mod, 0.05, 0.95)
 
+    # Compute transient threshold here — needed by both the rumble-tail
+    # gate below and the transient extractor a few lines down.
+    threshold = 0.45 - (sensitivity * 0.40)
+    threshold = max(0.05, threshold)
+
+    # ── Per-impact rumble tail + sharpness peak ──────────
+    # For each detected impact frame, add an exponential decay onto
+    # envelope_signal (per-class tail duration / decay tau) and punch
+    # sharpness toward IMPACT_SHARPNESS_PEAK with its own decay.
+    # Uses max(...) so existing louder content is never lowered.
+    if (ai_haptic is not None
+            and len(dsp_dominant) == n_frames
+            and len(envelope_signal) == n_frames):
+        _rumble_max = settings.IMPACT_RUMBLE_TAIL_S
+        _sharp_peak = settings.IMPACT_SHARPNESS_PEAK
+        _sharp_tau = settings.IMPACT_SHARPNESS_DECAY_S
+        _sharp_n = max(1, int((_sharp_tau * 5.0) / frame_dur))
+        _last_tail_t = -1.0
+        _BURST_CLASSES_LOCAL = {
+            "Explosion", "Smash, crash", "Bang", "Thunder",
+            "Thunderstorm", "Gunshot, gunfire", "Machine gun",
+            "Fusillade", "Artillery fire", "Thump, thud",
+            "Whack, thwack", "Slap, smack",
+        }
+        for _fi in range(n_frames):
+            if ai_haptic[_fi] < 0.15:
+                continue
+            if combined[_fi] < threshold * 0.5:
+                continue
+            _lbl = dsp_dominant[_fi]
+            if _lbl not in _BURST_CLASSES_LOCAL:
+                continue
+            _t_now = _fi * frame_dur
+            if (_t_now - _last_tail_t) < 0.40:
+                continue
+            _last_tail_t = _t_now
+            _tmpl = _IMPACT_TEMPLATES.get(_lbl, _IMPACT_TEMPLATE_DEFAULT)
+
+            # Sharpness peak (always — even templates without tails crisp up)
+            _end_sf = min(n_frames, _fi + _sharp_n)
+            for _sf in range(_fi, _end_sf):
+                _decay_s = float(np.exp(-(_sf - _fi) * frame_dur / _sharp_tau))
+                _target_s = _sharp_peak * _decay_s + sharpness[_sf] * (1.0 - _decay_s)
+                if _target_s > sharpness[_sf]:
+                    sharpness[_sf] = _target_s
+
+            # Rumble tail (only for templates that specify one)
+            _tail = _tmpl.get("tail")
+            if _tail is None:
+                continue
+            _tail_dur, _tail_peak, _tail_tau, _ = _tail
+            _tail_dur = min(_tail_dur, _rumble_max)
+            _end_tf = min(n_frames, _fi + int(_tail_dur / frame_dur))
+            _base_int = float(np.clip(0.85 + 0.15 * ai_haptic[_fi], 0.85, 1.0))
+            for _tf in range(_fi, _end_tf):
+                _decay_t = float(np.exp(-(_tf - _fi) * frame_dur / _tail_tau))
+                _v = _base_int * _tail_peak * _decay_t
+                if _v > envelope_signal[_tf]:
+                    envelope_signal[_tf] = _v
+        sharpness = np.clip(sharpness, 0.05, 0.95)
+        envelope_signal = np.clip(envelope_signal, 0.0, 1.0)
+
     # ── Downsample to envelope rate (~20 fps) ────────────
     intensity_env, actual_env_fps = _downsample_max(envelope_signal, frame_dur, ENVELOPE_FPS)
     sharpness_env, _ = _downsample_mean(sharpness, frame_dur, ENVELOPE_FPS)
@@ -578,9 +692,6 @@ def fuse_scores(
     # Use the raw post-gate combined signal (NOT _boost_array which
     # remaps everything > 0.01 up to 0.25 — that floor would fire
     # 25%-intensity taps on every suppressed-speech residual frame).
-
-    threshold = 0.45 - (sensitivity * 0.40)
-    threshold = max(0.05, threshold)
 
     events = _extract_transient_events(
         combined=combined,
@@ -814,10 +925,10 @@ def _extract_transient_events(
             )
         )
 
-    # ── Crash/impact burst transients ────────────────────
-    # When AI detects a crash/explosion with strong confidence,
-    # inject a burst of 3 rapid transients with varied sharpness
-    # (sharp→medium→deep) for a visceral "shattering" feel.
+    # ── Crash/impact burst transients (per-class templates) ──
+    # Each impact class has its own multi-tap signature in
+    # _IMPACT_TEMPLATES (offset, intensity scale, sharpness per tap)
+    # plus optional pre-impact whoosh and rumble tail.
     _BURST_CLASSES = {
         "Explosion", "Smash, crash", "Bang", "Thunder",
         "Thunderstorm", "Gunshot, gunfire", "Machine gun",
@@ -826,38 +937,54 @@ def _extract_transient_events(
     }
     _RAPID_FIRE_CLASSES = {"Machine gun", "Fusillade", "Artillery fire"}
     if ai_haptic is not None and dsp_dominant is not None:
-        burst_spacing = 0.030     # 30 ms between burst taps
         last_burst_t = -1.0
-        burst_sharpness = [0.95, 0.60, 0.25]  # sharp→medium→deep
         for fi in range(n_frames):
             if fi >= len(ai_haptic) or fi >= len(dsp_dominant):
                 break
             if ai_haptic[fi] < 0.15:
                 continue
-            if dsp_dominant[fi] not in _BURST_CLASSES:
+            lbl = dsp_dominant[fi]
+            if lbl not in _BURST_CLASSES:
                 continue
             # YAMNet false positives can label silent frames as "Explosion".
-            # Require the gated audio signal to be above the onset threshold
-            # so bursts only fire when there's real impact energy under them.
             if combined[fi] < threshold * 0.5:
                 continue
             t = fi * frame_dur
-            # Rapid fire classes get shorter cooldown for sustained burst feel
-            _cooldown = 0.12 if dsp_dominant[fi] in _RAPID_FIRE_CLASSES else 0.50
+            _cooldown = 0.12 if lbl in _RAPID_FIRE_CLASSES else 0.50
             if (t - last_burst_t) < _cooldown:
                 continue
-            for b in range(3):
-                bt = t + b * burst_spacing
-                overlap = any(abs(e.time - bt) < 0.015 for e in events)
-                if overlap:
+
+            tmpl = _IMPACT_TEMPLATES.get(lbl, _IMPACT_TEMPLATE_DEFAULT)
+            base_int = float(np.clip(0.85 + 0.15 * ai_haptic[fi], 0.85, 1.0))
+
+            # Pre-impact anticipation tap (audio-gated against silence/dialogue)
+            pre = tmpl.get("pre")
+            if pre is not None:
+                p_off_ms, p_iscale, p_sharp = pre
+                pt = t - (p_off_ms / 1000.0)
+                pf = int(pt / frame_dur)
+                if (pt >= 0.0 and 0 <= pf < n_frames
+                        and combined[pf] >= threshold * 0.25
+                        and not any(abs(e.time - pt) < 0.015 for e in events)):
+                    events.append(HapticEvent(
+                        time=round(pt, 4),
+                        event_type="transient",
+                        duration=0.0,
+                        intensity=round(base_int * p_iscale, 4),
+                        sharpness=round(p_sharp, 4),
+                    ))
+
+            # Main multi-tap burst from template
+            for off_ms, iscale, sharp in tmpl["taps"]:
+                bt = t + (off_ms / 1000.0)
+                if any(abs(e.time - bt) < 0.012 for e in events):
                     continue
-                bi = float(np.clip(0.85 + 0.15 * ai_haptic[fi], 0.85, 1.0))
                 events.append(HapticEvent(
                     time=round(bt, 4),
                     event_type="transient",
                     duration=0.0,
-                    intensity=round(bi, 4),
-                    sharpness=burst_sharpness[b],
+                    intensity=round(base_int * iscale, 4),
+                    sharpness=round(sharp, 4),
                 ))
             last_burst_t = t
 

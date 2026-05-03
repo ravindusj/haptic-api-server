@@ -38,7 +38,7 @@ class Settings(BaseSettings):
 
     # ── Haptic Generation ────────────────────────────────
     DEFAULT_SENSITIVITY: float = 0.5      # 0-1, controls threshold
-    MIN_TRANSIENT_INTERVAL_MS: float = 50 # debounce between taps
+    MIN_TRANSIENT_INTERVAL_MS: float = 25 # debounce between taps (low enough to keep burst taps intact)
     SILENCE_RMS_THRESHOLD: float = 0.003  # below = silence (raw RMS)
     SPEECH_SUPPRESSION_FACTOR: float = 0.05  # near-zero for dialogue
     DRUM_SUPPRESSION_FACTOR: float = 0.15   # residual when drums dominant (0=mute, 1=pass)
@@ -64,6 +64,15 @@ class Settings(BaseSettings):
 
     # ── Post-Boost Rest Gate ─────────────────────────────
     POST_BOOST_REST_THRESHOLD: float = 0.18     # non-dynamic frames below this after boost → zero
+
+    # ── Impact authoring ─────────────────────────────────
+    IMPACT_PRE_OFFSET_MS: float = 180.0         # anticipation tap lead time
+    IMPACT_PRE_INTENSITY_SCALE: float = 0.30    # whoosh = 30% of main intensity
+    IMPACT_PRE_SHARPNESS: float = 0.40          # soft, low-frequency-ish whoosh
+    IMPACT_RUMBLE_TAIL_S: float = 1.20          # max tail duration after big impact
+    IMPACT_RUMBLE_DECAY_S: float = 0.45         # exp decay tau for the tail
+    IMPACT_SHARPNESS_PEAK: float = 0.95         # sharpness target at impact peak
+    IMPACT_SHARPNESS_DECAY_S: float = 0.30      # decay tau for sharpness peak
 
     MAX_AHAP_EVENTS_PER_CHUNK: int = 128  # Apple limit per pattern
     AHAP_CHUNK_DURATION_S: float = 30.0   # Apple limit per pattern
