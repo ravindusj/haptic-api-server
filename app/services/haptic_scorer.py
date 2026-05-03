@@ -233,8 +233,10 @@ def fuse_scores(
         np.minimum(speech_gate, yamnet_gate), # Whisper silent -> use YAMNet backup
     )
 
-    # Smooth gate edges (~80 ms crossfade)
-    gate_smooth = max(1, int(0.08 / frame_dur))
+    # Smooth gate edges (crossfade)
+    gate_smooth = max(
+        1, int((settings.SPEECH_GATE_SMOOTH_MS / 1000.0) / frame_dur)
+    )
     speech_gate = _smooth(speech_gate, gate_smooth)
     speech_gate = np.where(speech_gate < 0.02, 0.0, speech_gate)
 
@@ -282,11 +284,24 @@ def fuse_scores(
     # singing) drives continuous vibration — not just transients.
     harmonic_contribution = 0.15 * harm_rms_gated
 
+    # Voice F0 (~85-255 Hz) overlaps sub_bass+bass+low_mid; even
+    # after speech_gate=0.05 those bands carry voice prosody as low
+    # rumble. Hard-mute them on confirmed-speech frames; mid/presence
+    # still carry impact override energy for explosions in dialogue.
+    _voice_mute_active = speech_gate < (1.0 - settings.SPEECH_HIGH_CONFIDENCE)
+    voice_band_mute = np.where(_voice_mute_active, 0.0, 1.0).astype(np.float64)
+    voice_band_mute = _smooth(voice_band_mute, gate_smooth)
+    voice_band_mute = np.where(haptic_override, 1.0, voice_band_mute)
+
+    sub_bass_v = sub_bass * voice_band_mute
+    bass_v = bass * voice_band_mute
+    low_mid_v = low_mid * voice_band_mute
+
     combined = (
         weights.percussive * perc_modulated
-        + weights.sub_bass * sub_bass
-        + weights.bass * bass
-        + weights.low_mid * low_mid
+        + weights.sub_bass * sub_bass_v
+        + weights.bass * bass_v
+        + weights.low_mid * low_mid_v
         + weights.mid * mid
         + weights.presence * presence
         + weights.ai * ai_haptic
@@ -668,20 +683,21 @@ def _build_whisper_speech_gate(
     if not speech_segments:
         return gate
 
-    guard_pre = 0.10   # 100 ms guard before speech starts
-    guard_post = 0.04  # 40 ms guard after speech ends
+    guard_pre = settings.SPEECH_GUARD_PRE_MS / 1000.0
+    guard_post = settings.SPEECH_GUARD_POST_MS / 1000.0
+    floor = settings.SPEECH_SUPPRESSION_FACTOR
     for seg in speech_segments:
         start_s = max(0.0, seg.start - guard_pre)
         end_s = seg.end + guard_post
         start_f = int(start_s / frame_dur)
         end_f = min(n_frames, int(end_s / frame_dur) + 1)
 
-        # Proportional suppression based on confidence
-        suppression = float(seg.confidence)
-        gate[start_f:end_f] = np.minimum(
-            gate[start_f:end_f],
-            1.0 - suppression,
-        )
+        # Quadratic ramp toward SPEECH_SUPPRESSION_FACTOR floor —
+        # borderline confidence still suppresses substantially, and
+        # confirmed speech bottoms out at the configured floor.
+        conf = float(seg.confidence)
+        gate_val = floor + (1.0 - floor) * (1.0 - conf) ** 2
+        gate[start_f:end_f] = np.minimum(gate[start_f:end_f], gate_val)
 
     return gate
 

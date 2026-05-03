@@ -45,6 +45,13 @@ class Settings(BaseSettings):
     HAPTIC_OVERRIDE_THRESHOLD: float = 0.30    # ai_haptic must exceed this to override speech gate
     HAPTIC_OVERRIDE_PASS_THROUGH: float = 0.75 # max speech_gate value during override
 
+    # ── Speech / Dialogue Detection ──────────────────────
+    WHISPER_MIN_CONFIDENCE: float = 0.30       # min Whisper segment confidence to count as speech
+    SPEECH_GUARD_PRE_MS: float = 100.0         # guard before speech onset
+    SPEECH_GUARD_POST_MS: float = 180.0        # guard after speech offset (covers reverb/breath tail)
+    SPEECH_GATE_SMOOTH_MS: float = 80.0        # gate-edge crossfade
+    SPEECH_HIGH_CONFIDENCE: float = 0.55       # at/above this, hard-mute sub_bass+bass+low_mid
+
     # ── Novelty Gate Floors ──────────────────────────────
     NOVELTY_FLOOR_PER_BAND: float = 0.03        # min pass-through for band gates
     NOVELTY_FLOOR_PERCUSSIVE: float = 0.05      # min pass-through for percussive gate

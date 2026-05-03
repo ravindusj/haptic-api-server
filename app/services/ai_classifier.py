@@ -335,7 +335,7 @@ def _run_whisper(wav_path: str, duration: float) -> list[SpeechSegment]:
         for seg in segments:
             # no_speech_prob: probability that this segment has no speech
             confidence = 1.0 - getattr(seg, "no_speech_prob", 0.0)
-            if confidence < 0.3:
+            if confidence < settings.WHISPER_MIN_CONFIDENCE:
                 continue  # skip very low confidence segments
 
             speech_segments.append(SpeechSegment(
