@@ -286,9 +286,10 @@ def fuse_scores(
 
     # Voice F0 (~85-255 Hz) overlaps sub_bass+bass+low_mid; even
     # after speech_gate=0.05 those bands carry voice prosody as low
-    # rumble. Hard-mute them on confirmed-speech frames; mid/presence
+    # rumble. Hard-mute them on ANY detected-speech frame (gate < 0.95)
+    # so borderline-confidence speech is also handled. mid/presence
     # still carry impact override energy for explosions in dialogue.
-    _voice_mute_active = speech_gate < (1.0 - settings.SPEECH_HIGH_CONFIDENCE)
+    _voice_mute_active = speech_gate < 0.95
     voice_band_mute = np.where(_voice_mute_active, 0.0, 1.0).astype(np.float64)
     voice_band_mute = _smooth(voice_band_mute, gate_smooth)
     voice_band_mute = np.where(haptic_override, 1.0, voice_band_mute)
@@ -493,9 +494,10 @@ def fuse_scores(
         _post_speech_var /= _psv_max
     _env_var = np.clip(_post_speech_var, 0.0, 1.0)
     # Exclude speech-suppressed frames from the perceptual floor boost.
-    # Speech residual has variance (dynamic audio), but should NOT be
-    # re-boosted after suppression — that defeats dialogue silencing.
-    _speech_suppressed = _pad_or_trim_np(speech_gate, len(envelope_signal)) < 0.15
+    # Use < 0.95 so even low-confidence Whisper segments (whose gate
+    # only drops to ~0.5) are excluded — otherwise borderline speech
+    # gets re-boosted to 0.20+ and defeats dialogue silencing.
+    _speech_suppressed = _pad_or_trim_np(speech_gate, len(envelope_signal)) < 0.95
     _dynamic_mask = (envelope_signal > 0.01) & (_env_var > 0.30) & (~_speech_suppressed)
     _ambient_mask = (envelope_signal > 0.01) & (~_dynamic_mask)
     envelope_signal = np.where(
@@ -573,14 +575,15 @@ def fuse_scores(
     sharpness_env, _ = _downsample_mean(sharpness, frame_dur, ENVELOPE_FPS)
 
     # ── Extract transient tap events ─────────────────────
-    # Boost percussive signal for tap detection
-    boosted_for_taps = _boost_array(combined)
+    # Use the raw post-gate combined signal (NOT _boost_array which
+    # remaps everything > 0.01 up to 0.25 — that floor would fire
+    # 25%-intensity taps on every suppressed-speech residual frame).
 
     threshold = 0.45 - (sensitivity * 0.40)
     threshold = max(0.05, threshold)
 
     events = _extract_transient_events(
-        combined=boosted_for_taps,
+        combined=combined,
         onset=perc_onset,
         centroid=centroid,
         bass=bass,
@@ -596,13 +599,18 @@ def fuse_scores(
     )
 
     # ── Scene-cut accent transients from video ───────────
-    # Each detected scene change gets a tap scaled by cut magnitude.
+    # Each detected scene change gets a tap scaled by cut magnitude,
+    # but only if the audio at that moment isn't fully silenced — a
+    # cut over silent dialogue or black frames should not click.
     if video is not None and video.scene_changes:
         min_interval_sc = settings.MIN_TRANSIENT_INTERVAL_MS / 1000.0
+        added_sc = 0
         for sc in video.scene_changes:
+            sc_frame = int(sc.time / frame_dur)
+            if sc_frame >= n_frames or combined[sc_frame] < threshold * 0.5:
+                continue
             too_close = any(abs(e.time - sc.time) < min_interval_sc for e in events)
             if not too_close:
-                # Scale by magnitude: gentle dissolve → soft, hard cut → sharp
                 norm_mag = min(sc.magnitude / 5.0, 1.0)
                 events.append(HapticEvent(
                     time=round(sc.time, 4),
@@ -611,21 +619,27 @@ def fuse_scores(
                     intensity=round(0.50 + 0.50 * norm_mag, 4),
                     sharpness=round(0.40 + 0.50 * norm_mag, 4),
                 ))
+                added_sc += 1
         events.sort(key=lambda e: e.time)
-        logger.info("Added %d scene-cut transients", len(video.scene_changes))
+        logger.info("Added %d/%d scene-cut transients (audio-gated)", added_sc, len(video.scene_changes))
 
     # ── Video scenario transients ────────────────────
-    # Per-scenario transient events from action recognition.
+    # Per-scenario transient events from action recognition. These are
+    # video-driven, so audio-gate them: a "punch" action with no impact
+    # sound should not click the wrist.
     if scenario_transients:
         min_interval_vt = settings.MIN_TRANSIENT_INTERVAL_MS / 1000.0
         added_vt = 0
         for vt in scenario_transients:
+            vt_frame = int(vt.time / frame_dur)
+            if vt_frame >= n_frames or combined[vt_frame] < threshold * 0.5:
+                continue
             too_close = any(abs(e.time - vt.time) < min_interval_vt for e in events)
             if not too_close:
                 events.append(vt)
                 added_vt += 1
         events.sort(key=lambda e: e.time)
-        logger.info("Added %d/%d scenario-specific transients", added_vt, len(scenario_transients))
+        logger.info("Added %d/%d scenario-specific transients (audio-gated)", added_vt, len(scenario_transients))
 
     # Compute speech suppression percentage
     whisper_pct = 0.0
@@ -770,9 +784,14 @@ def _extract_transient_events(
 
     # ── Beat-aligned transients ──────────────────────────
     for bt, bs in zip(beat_times, beat_strengths):
-        if bs < 0.12:
+        if bs < 0.25:
             continue
         beat_frame = int(bt / frame_dur)
+        # Underlying combined signal must be above the same gate used for
+        # onset transients — prevents steady "tik tik" beats firing in
+        # silent or fully-gated frames where there's nothing to vibrate to.
+        if beat_frame >= n_frames or combined[beat_frame] < threshold * 0.5:
+            continue
         if speech_gate is not None:
             if beat_frame < len(speech_gate) and speech_gate[beat_frame] < 0.1:
                 if bs < 0.50:  # allow very strong beats at speech boundary
@@ -816,6 +835,11 @@ def _extract_transient_events(
             if ai_haptic[fi] < 0.15:
                 continue
             if dsp_dominant[fi] not in _BURST_CLASSES:
+                continue
+            # YAMNet false positives can label silent frames as "Explosion".
+            # Require the gated audio signal to be above the onset threshold
+            # so bursts only fire when there's real impact energy under them.
+            if combined[fi] < threshold * 0.5:
                 continue
             t = fi * frame_dur
             # Rapid fire classes get shorter cooldown for sustained burst feel
