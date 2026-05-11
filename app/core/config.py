@@ -74,6 +74,14 @@ class Settings(BaseSettings):
     IMPACT_SHARPNESS_PEAK: float = 0.95         # sharpness target at impact peak
     IMPACT_SHARPNESS_DECAY_S: float = 0.30      # decay tau for sharpness peak
 
+    # ── Multimodal (audio + visual) fusion ───────────────
+    VISUAL_FLASH_THRESHOLD: float = 0.30        # min flash level to count as visual evidence
+    CAMERA_SHAKE_THRESHOLD: float = 0.30        # min shake level to count as visual evidence
+    CROSS_MODAL_WINDOW_MS: float = 150.0        # ± window for audio↔visual alignment
+    CROSS_MODAL_BOOST: float = 1.15             # tap intensity multiplier when both modalities align
+    VISUAL_ONLY_FLASH_MIN: float = 0.50         # flash floor for firing a visual-only impact
+    VISUAL_ONLY_SHAKE_MIN: float = 0.30         # shake floor (combined with flash) for visual-only
+
     MAX_AHAP_EVENTS_PER_CHUNK: int = 128  # Apple limit per pattern
     AHAP_CHUNK_DURATION_S: float = 30.0   # Apple limit per pattern
 

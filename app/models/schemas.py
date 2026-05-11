@@ -187,6 +187,10 @@ class VideoFeatures(BaseModel):
     motion_intensity: list[float]      # 0-1 per analysis frame
     scene_changes: list[SceneChange]   # scene cuts with time + magnitude
 
+    # Tier 1.5: Per-frame visual impact signals
+    visual_flash: list[float] = []     # 0-1, brightness-spike vs rolling baseline
+    camera_shake: list[float] = []     # 0-1, normalised global-translation magnitude
+
     # Tier 2: MoViNet action recognition
     action_scores: dict[str, list[float]]  # category → per-window scores
     dominant_actions: list[str]        # dominant category per window

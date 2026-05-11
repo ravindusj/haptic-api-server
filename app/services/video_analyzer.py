@@ -168,7 +168,7 @@ def analyze_video(video_path: str) -> VideoFeatures:
     logger.info("Video analysis: %.2fs video at %s", duration, video_path)
 
     # ── Tier 1: Motion intensity via optical flow ────────
-    motion_intensity, scene_changes = _compute_motion_features(
+    motion_intensity, scene_changes, visual_flash, camera_shake = _compute_motion_features(
         video_path, duration,
     )
     logger.info(
@@ -197,6 +197,8 @@ def analyze_video(video_path: str) -> VideoFeatures:
         duration_seconds=duration,
         motion_intensity=motion_intensity,
         scene_changes=scene_changes,
+        visual_flash=visual_flash,
+        camera_shake=camera_shake,
         action_scores=action_scores,
         dominant_actions=dominant_actions,
         action_window_duration_s=window_dur,
@@ -225,7 +227,7 @@ def _compute_motion_features(
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         logger.warning("Cannot open video: %s", video_path)
-        return [], []
+        return [], [], [], []
 
     vid_fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
     total_vid_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
@@ -238,6 +240,9 @@ def _compute_motion_features(
     raw_magnitudes: list[float] = []
     frame_diffs: list[float] = []
     frame_times: list[float] = []
+    # Per-frame luma + per-frame global translation (V1 + V2)
+    luma_vals: list[float] = []
+    global_trans: list[float] = []
 
     frame_idx = 0
     while True:
@@ -266,6 +271,14 @@ def _compute_motion_features(
                 mean_mag = float(np.mean(mag))
                 raw_magnitudes.append(mean_mag)
 
+                # V1: per-frame luma (aligned with motion_intensity)
+                luma_vals.append(float(np.mean(gray)))
+
+                # V2: global translation magnitude (mean flow vector)
+                gx = float(np.mean(flow[..., 0]))
+                gy = float(np.mean(flow[..., 1]))
+                global_trans.append(float(np.sqrt(gx * gx + gy * gy)))
+
                 # Frame difference for scene cut detection
                 diff = float(np.mean(np.abs(
                     gray.astype(np.float32) - prev_gray.astype(np.float32)
@@ -280,7 +293,7 @@ def _compute_motion_features(
     cap.release()
 
     if not raw_magnitudes:
-        return [], []
+        return [], [], [], []
 
     # Normalise motion to 0-1
     raw_arr = np.array(raw_magnitudes, dtype=np.float64)
@@ -302,13 +315,42 @@ def _compute_motion_features(
                     magnitude=round(float(d / threshold), 3),
                 ))
 
+    # ── V1: Visual flash via brightness-spike vs rolling baseline ──
+    # Frame-relative measure: (luma - rolling_median) / rolling_median.
+    # Robust to lighting; spikes only on sudden brightenings.
+    visual_flash: list[float] = []
+    if luma_vals:
+        luma_arr = np.array(luma_vals, dtype=np.float64)
+        win = max(3, int(round(VIDEO_ANALYSIS_FPS * 0.6)))  # ~600ms baseline
+        pad = win // 2
+        padded = np.pad(luma_arr, pad, mode="edge")
+        baseline = np.array([
+            np.median(padded[i:i + win]) for i in range(len(luma_arr))
+        ])
+        eps = 1.0  # avoid div-by-zero on very dark frames
+        rel = (luma_arr - baseline) / np.maximum(baseline, eps)
+        visual_flash = [round(float(np.clip(v, 0.0, 1.0)), 4) for v in rel]
+
+    # ── V2: Camera shake from global translation magnitude ─────────
+    # Normalised by 99th percentile so a few violent shakes don't
+    # compress the rest of the signal to near-zero.
+    camera_shake: list[float] = []
+    if global_trans:
+        trans_arr = np.array(global_trans, dtype=np.float64)
+        peak = np.percentile(trans_arr, 99) if len(trans_arr) > 0 else 1.0
+        if peak > 1e-6:
+            trans_arr = trans_arr / peak
+        camera_shake = [round(float(np.clip(v, 0.0, 1.0)), 4) for v in trans_arr]
+
     logger.info(
         "Optical flow: %d frames analysed (step=%d), "
-        "scene_cuts=%d",
+        "scene_cuts=%d, flash_max=%.3f, shake_max=%.3f",
         len(motion_intensity), frame_step, len(scene_changes),
+        max(visual_flash) if visual_flash else 0.0,
+        max(camera_shake) if camera_shake else 0.0,
     )
 
-    return motion_intensity, scene_changes
+    return motion_intensity, scene_changes, visual_flash, camera_shake
 
 
 # ── Tier 2: MoViNet action classification ───────────────

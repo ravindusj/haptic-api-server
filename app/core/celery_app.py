@@ -1,6 +1,6 @@
 """Celery application and async task definitions.
 
-Pipeline: extract_audio → [analyze_dsp + analyze_video] → classify_ai → fuse_scores → generate_ahap
+Pipeline: extract_audio → [analyze_dsp + analyze_video + classify_ai] → fuse_scores → generate_ahap
 """
 
 from __future__ import annotations
@@ -169,10 +169,9 @@ def analyze_video_task(
 
     This is the main Celery task that runs the entire pipeline:
     1. Extract audio from video (FFmpeg)
-    2. DSP feature extraction (librosa)
-    3. AI sound event classification (YAMNet + Whisper)
-    4. Haptic score fusion (DSP + AI)
-    5. AHAP file generation
+    2. DSP + Video + AI analysis (parallel)
+    3. Haptic score fusion (DSP + AI + Video)
+    4. AHAP file generation
 
     Parameters
     ----------
@@ -203,31 +202,33 @@ def analyze_video_task(
             duration=duration,
         )
 
-        # ── Step 2: DSP + Video Analysis (parallel) ──────
-        _set_job_status(job_id, "analyzing_dsp", progress=25.0)
-        logger.info("[%s] Step 2/6: DSP + Video analysis (parallel)…", job_id)
+        # ── Step 2+3: DSP + Video + AI (parallel) ────────
+        _set_job_status(job_id, "analyzing", progress=25.0)
+        logger.info("[%s] Step 2/5: DSP + Video + AI (parallel)…", job_id)
 
         from concurrent.futures import ThreadPoolExecutor, as_completed
         from app.services.dsp_analyzer import analyze_dsp
         from app.services.video_analyzer import analyze_video
+        from app.services.ai_classifier import classify_audio
 
         video_features = None
+        dsp_features = None
+        ai_result = None
 
-        with ThreadPoolExecutor(max_workers=2) as pool:
+        with ThreadPoolExecutor(max_workers=3) as pool:
             dsp_future = pool.submit(analyze_dsp, audio_result["librosa_wav"])
             vid_future = pool.submit(analyze_video, video_path)
+            ai_future = pool.submit(classify_audio, audio_result["classifier_wav"])
 
-            for future in as_completed([dsp_future, vid_future]):
+            for future in as_completed([dsp_future, vid_future, ai_future]):
                 if future is dsp_future:
                     dsp_features = future.result()
-                    _set_job_status(job_id, "analyzing_dsp", progress=40.0)
+                    _set_job_status(job_id, "analyzing_dsp", progress=45.0)
                     logger.info("[%s] DSP analysis done", job_id)
-                else:
+                elif future is vid_future:
                     try:
                         video_features = future.result()
-                        _set_job_status(
-                            job_id, "analyzing_video", progress=45.0,
-                        )
+                        _set_job_status(job_id, "analyzing_video", progress=55.0)
                         logger.info(
                             "[%s] Video analysis done – dominant: %s",
                             job_id,
@@ -240,21 +241,17 @@ def analyze_video_task(
                             job_id, ve,
                         )
                         video_features = None
+                else:
+                    ai_result = future.result()
+                    _set_job_status(job_id, "classifying_ai", progress=70.0)
+                    logger.info("[%s] AI classification done", job_id)
 
-        _set_job_status(job_id, "analyzing_dsp", progress=48.0)
+        if dsp_features is None or ai_result is None:
+            raise RuntimeError("Required analysis stage failed (DSP or AI)")
 
-        # ── Step 3: AI Classification ────────────────────
-        _set_job_status(job_id, "classifying_ai", progress=50.0)
-        logger.info("[%s] Step 3/6: AI classification…", job_id)
-
-        from app.services.ai_classifier import classify_audio
-        ai_result = classify_audio(audio_result["classifier_wav"])
-
-        _set_job_status(job_id, "classifying_ai", progress=70.0)
-
-        # ── Step 4: Score Fusion ─────────────────────────
+        # ── Step 3: Score Fusion ─────────────────────────
         _set_job_status(job_id, "scoring", progress=75.0)
-        logger.info("[%s] Step 4/6: Score fusion…", job_id)
+        logger.info("[%s] Step 3/5: Score fusion…", job_id)
 
         from app.services.haptic_scorer import fuse_scores
         timeline = fuse_scores(
@@ -276,9 +273,9 @@ def analyze_video_task(
         except Exception as save_err:
             logger.warning("[%s] Analysis data save failed (non-fatal): %s", job_id, save_err)
 
-        # ── Step 5: AHAP Generation ─────────────────────
+        # ── Step 4: AHAP Generation ─────────────────────
         _set_job_status(job_id, "generating_ahap", progress=90.0)
-        logger.info("[%s] Step 5/6: Generating AHAP…", job_id)
+        logger.info("[%s] Step 4/5: Generating AHAP…", job_id)
 
         from app.services.ahap_generator import generate_ahap, save_ahap
         ahap = generate_ahap(timeline, job_id)

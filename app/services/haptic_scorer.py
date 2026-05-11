@@ -365,8 +365,18 @@ def fuse_scores(
     # Resample video motion_intensity to DSP frame rate and add
     # as a weighted signal.  When no video data, weight is zero.
     video_motion = np.zeros(n_frames, dtype=np.float64)
+    video_flash = np.zeros(n_frames, dtype=np.float64)
+    video_shake = np.zeros(n_frames, dtype=np.float64)
     video_actions: list[str] = []
     video_action_scores: dict[str, np.ndarray] = {}
+    if video is not None and video.visual_flash:
+        video_flash = _resample_to_length(
+            np.array(video.visual_flash, dtype=np.float64), n_frames
+        )
+    if video is not None and video.camera_shake:
+        video_shake = _resample_to_length(
+            np.array(video.camera_shake, dtype=np.float64), n_frames
+        )
     if video is not None and video.motion_intensity:
         video_motion = _resample_to_length(
             np.array(video.motion_intensity, dtype=np.float64), n_frames
@@ -707,6 +717,8 @@ def fuse_scores(
         speech_gate=speech_gate,
         ai_haptic=ai_haptic,
         dsp_dominant=dsp_dominant,
+        video_flash=video_flash,
+        video_shake=video_shake,
     )
 
     # ── Scene-cut accent transients from video ───────────
@@ -844,6 +856,8 @@ def _extract_transient_events(
     speech_gate: np.ndarray | None = None,
     ai_haptic: np.ndarray | None = None,
     dsp_dominant: list[str] | None = None,
+    video_flash: np.ndarray | None = None,
+    video_shake: np.ndarray | None = None,
 ) -> list[HapticEvent]:
     """Extract transient (tap) events from percussive signal.
 
@@ -957,6 +971,26 @@ def _extract_transient_events(
             tmpl = _IMPACT_TEMPLATES.get(lbl, _IMPACT_TEMPLATE_DEFAULT)
             base_int = float(np.clip(0.85 + 0.15 * ai_haptic[fi], 0.85, 1.0))
 
+            # ── Cross-modal confirmation (V4) ──
+            # If a flash or shake spike sits within ±CROSS_MODAL_WINDOW_MS
+            # of this audio impact, multiply tap intensities by the boost.
+            half_win = int(
+                (settings.CROSS_MODAL_WINDOW_MS / 1000.0) / frame_dur
+            )
+            flash_max = 0.0
+            shake_max = 0.0
+            if video_flash is not None and video_shake is not None:
+                lo = max(0, fi - half_win)
+                hi = min(n_frames, fi + half_win + 1)
+                if hi > lo:
+                    flash_max = float(np.max(video_flash[lo:hi]))
+                    shake_max = float(np.max(video_shake[lo:hi]))
+            visual_confirmed = (
+                flash_max >= settings.VISUAL_FLASH_THRESHOLD
+                or shake_max >= settings.CAMERA_SHAKE_THRESHOLD
+            )
+            boost = settings.CROSS_MODAL_BOOST if visual_confirmed else 1.0
+
             # Pre-impact anticipation tap (audio-gated against silence/dialogue)
             pre = tmpl.get("pre")
             if pre is not None:
@@ -970,7 +1004,7 @@ def _extract_transient_events(
                         time=round(pt, 4),
                         event_type="transient",
                         duration=0.0,
-                        intensity=round(base_int * p_iscale, 4),
+                        intensity=round(min(1.0, base_int * p_iscale * boost), 4),
                         sharpness=round(p_sharp, 4),
                     ))
 
@@ -983,10 +1017,47 @@ def _extract_transient_events(
                     time=round(bt, 4),
                     event_type="transient",
                     duration=0.0,
-                    intensity=round(base_int * iscale, 4),
+                    intensity=round(min(1.0, base_int * iscale * boost), 4),
                     sharpness=round(sharp, 4),
                 ))
             last_burst_t = t
+
+    # ── Visual-only impacts (silent-explosion / slow-mo path) ──
+    # Fires when strong flash AND shake align with no audio impact nearby.
+    # Uses the Bang template (3 taps + 0.45s rumble) deliberately as the
+    # generic "something happened" signature.
+    if video_flash is not None and video_shake is not None:
+        flash_min = settings.VISUAL_ONLY_FLASH_MIN
+        shake_min = settings.VISUAL_ONLY_SHAKE_MIN
+        cool = 0.40
+        last_vo_t = -1.0
+        audio_impact_times = sorted(
+            e.time for e in events if e.intensity >= 0.6
+        )
+        for fi in range(n_frames):
+            if fi >= len(video_flash) or fi >= len(video_shake):
+                break
+            if video_flash[fi] < flash_min or video_shake[fi] < shake_min:
+                continue
+            t_vo = fi * frame_dur
+            if (t_vo - last_vo_t) < cool:
+                continue
+            if any(abs(at - t_vo) <= 0.20 for at in audio_impact_times):
+                continue
+            last_vo_t = t_vo
+            tmpl = _IMPACT_TEMPLATES["Bang"]
+            base_int = 0.55 + 0.35 * float(video_flash[fi])
+            for off_ms, iscale, sharp in tmpl["taps"]:
+                bt = t_vo + (off_ms / 1000.0)
+                if any(abs(e.time - bt) < 0.012 for e in events):
+                    continue
+                events.append(HapticEvent(
+                    time=round(bt, 4),
+                    event_type="transient",
+                    duration=0.0,
+                    intensity=round(base_int * iscale, 4),
+                    sharpness=round(sharp, 4),
+                ))
 
     events.sort(key=lambda e: e.time)
     return events
