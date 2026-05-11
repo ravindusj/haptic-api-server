@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from celery import Celery
+from celery.signals import worker_process_init
 
 from app.core.config import get_settings
 
@@ -38,6 +39,36 @@ celery_app.conf.update(
     worker_prefetch_multiplier=1,        # one task at a time (heavy)
     result_expires=86400,                # results expire after 24h
 )
+
+
+# ── Model pre-warming ────────────────────────────────────
+#
+# Celery's prefork pool forks a fresh child per concurrency slot.  Module
+# singletons in ai_classifier / video_analyzer are per-process, so each
+# child must load YAMNet, Whisper and MoViNet on its first task — adding
+# 5-15 s latency to the first job after a worker (re)start.
+#
+# `worker_process_init` fires once per child immediately after fork.
+# Loading the models here keeps them resident for the lifetime of the
+# child, so every task reuses the already-loaded weights.
+
+
+@worker_process_init.connect
+def _prewarm_models(**_kwargs) -> None:
+    """Load all heavy ML models once per worker child process."""
+    logger.info("Pre-warming models in worker process…")
+    try:
+        from app.services.ai_classifier import _load_yamnet, _load_whisper
+        from app.services.video_analyzer import _load_movinet, _load_kinetics_labels
+
+        _load_yamnet()
+        _load_whisper()
+        _load_movinet()
+        _load_kinetics_labels()
+        logger.info("Model pre-warm complete")
+    except Exception as e:
+        # Non-fatal: models will lazy-load on first use if pre-warm fails.
+        logger.warning("Model pre-warm failed (will lazy-load): %s", e)
 
 
 # ── Job status helpers (stored in Redis) ─────────────────
