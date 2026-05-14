@@ -167,10 +167,10 @@ def analyze_video(video_path: str) -> VideoFeatures:
     duration = _get_duration(video_path)
     logger.info("Video analysis: %.2fs video at %s", duration, video_path)
 
-    # ── Tier 1: Motion intensity via optical flow ────────
-    motion_intensity, scene_changes, visual_flash, camera_shake = _compute_motion_features(
-        video_path, duration,
-    )
+    # ── Single decode pass: motion features + MoViNet input ──
+    (motion_intensity, scene_changes, visual_flash, camera_shake,
+     movinet_frames) = _decode_and_compute_motion(video_path)
+
     logger.info(
         "Motion analysis: %d frames, %d scene changes, "
         "avg_motion=%.3f, peak_motion=%.3f",
@@ -180,9 +180,9 @@ def analyze_video(video_path: str) -> VideoFeatures:
         float(np.max(motion_intensity)) if motion_intensity else 0.0,
     )
 
-    # ── Tier 2: MoViNet action recognition ───────────────
+    # ── Tier 2: MoViNet action recognition (reuses decoded frames) ──
     action_scores, dominant_actions, window_dur = _classify_actions(
-        video_path, duration,
+        movinet_frames, duration,
     )
     logger.info(
         "Action classification: %d windows (%.2fs each), categories=%s",
@@ -205,44 +205,47 @@ def analyze_video(video_path: str) -> VideoFeatures:
     )
 
 
-# ── Tier 1: Optical flow motion detection ───────────────
+# ── Single-pass decode: motion features + MoViNet input ──
 
 
-def _compute_motion_features(
+def _decode_and_compute_motion(
     video_path: str,
-    duration: float,
-) -> tuple[list[float], list[SceneChange]]:
-    """Compute per-frame motion intensity via dense optical flow.
+) -> tuple[list[float], list[SceneChange], list[float], list[float], list[np.ndarray]]:
+    """Decode the video once and produce both motion features and
+    MoViNet input frames.
 
-    Samples the video at VIDEO_ANALYSIS_FPS (5 fps) and computes
-    Farneback optical flow between consecutive frames.
+    Previously the video was opened twice — once for optical flow and
+    once for MoViNet — doubling decode cost.  This pass samples each
+    target frame exactly once and emits:
+
+      * Resized grayscale (320 wide) → optical flow / scene cuts / luma
+      * Resized RGB uint8 (MOVINET_SIZE²) → cached for MoViNet inference
+
+    The MoViNet buffer is kept as uint8 to limit memory; conversion to
+    float32 happens per-window inside ``_classify_actions``.
 
     Returns
     -------
-    motion_intensity : list[float]
-        0-1 normalised motion magnitude per frame.
-    scene_changes : list[float]
-        Timestamps (seconds) of detected scene cuts.
+    motion_intensity, scene_changes, visual_flash, camera_shake,
+    movinet_frames
     """
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         logger.warning("Cannot open video: %s", video_path)
-        return [], [], [], []
+        return [], [], [], [], []
 
     vid_fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-    total_vid_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
 
     # Compute frame step to achieve target analysis FPS
     frame_step = max(1, int(round(vid_fps / VIDEO_ANALYSIS_FPS)))
-    analysis_interval = frame_step / vid_fps  # seconds between samples
 
     prev_gray: np.ndarray | None = None
     raw_magnitudes: list[float] = []
     frame_diffs: list[float] = []
     frame_times: list[float] = []
-    # Per-frame luma + per-frame global translation (V1 + V2)
     luma_vals: list[float] = []
     global_trans: list[float] = []
+    movinet_frames: list[np.ndarray] = []
 
     frame_idx = 0
     while True:
@@ -251,7 +254,12 @@ def _compute_motion_features(
             break
 
         if frame_idx % frame_step == 0:
-            # Resize for speed (320px wide)
+            # ── MoViNet input: resize once, store as uint8 RGB ──
+            mv = cv2.resize(frame, (MOVINET_SIZE, MOVINET_SIZE))
+            mv = cv2.cvtColor(mv, cv2.COLOR_BGR2RGB)
+            movinet_frames.append(mv)  # uint8, ~88 KB per frame
+
+            # ── Motion input: resize to 320 wide, grayscale ──
             h, w = frame.shape[:2]
             scale = 320.0 / max(w, 1)
             small = cv2.resize(frame, (320, max(1, int(h * scale))))
@@ -268,18 +276,14 @@ def _compute_motion_features(
                     flags=0,
                 )
                 mag = np.sqrt(flow[..., 0] ** 2 + flow[..., 1] ** 2)
-                mean_mag = float(np.mean(mag))
-                raw_magnitudes.append(mean_mag)
+                raw_magnitudes.append(float(np.mean(mag)))
 
-                # V1: per-frame luma (aligned with motion_intensity)
                 luma_vals.append(float(np.mean(gray)))
 
-                # V2: global translation magnitude (mean flow vector)
                 gx = float(np.mean(flow[..., 0]))
                 gy = float(np.mean(flow[..., 1]))
                 global_trans.append(float(np.sqrt(gx * gx + gy * gy)))
 
-                # Frame difference for scene cut detection
                 diff = float(np.mean(np.abs(
                     gray.astype(np.float32) - prev_gray.astype(np.float32)
                 )))
@@ -293,7 +297,7 @@ def _compute_motion_features(
     cap.release()
 
     if not raw_magnitudes:
-        return [], [], [], []
+        return [], [], [], [], movinet_frames
 
     # Normalise motion to 0-1
     raw_arr = np.array(raw_magnitudes, dtype=np.float64)
@@ -350,7 +354,7 @@ def _compute_motion_features(
         max(camera_shake) if camera_shake else 0.0,
     )
 
-    return motion_intensity, scene_changes, visual_flash, camera_shake
+    return motion_intensity, scene_changes, visual_flash, camera_shake, movinet_frames
 
 
 # ── Tier 2: MoViNet action classification ───────────────
@@ -412,13 +416,14 @@ def _load_kinetics_labels() -> list[str]:
 
 
 def _classify_actions(
-    video_path: str,
+    frames: list[np.ndarray],
     duration: float,
 ) -> tuple[dict[str, list[float]], list[str], float]:
     """Classify video actions using MoViNet-A0.
 
-    Processes the video in sliding windows of MOVINET_WINDOW frames,
-    each resized to MOVINET_SIZE × MOVINET_SIZE.
+    Consumes the pre-decoded MoViNet input frames produced by
+    ``_decode_and_compute_motion`` (uint8 RGB at MOVINET_SIZE²).
+    Processes them in sliding windows of MOVINET_WINDOW frames.
 
     Returns
     -------
@@ -431,49 +436,21 @@ def _classify_actions(
     """
     model = _load_movinet()
     labels = _load_kinetics_labels()
+    window_dur = MOVINET_WINDOW / VIDEO_ANALYSIS_FPS
 
     # If model failed to load, return motion-only fallback
     if model is None:
-        n_windows = max(1, int(duration / (MOVINET_WINDOW / VIDEO_ANALYSIS_FPS)))
+        n_windows = max(1, int(duration / window_dur))
         empty_scores = {cat: [0.0] * n_windows for cat in ALL_ACTION_CATEGORIES}
-        empty_dominant = ["none"] * n_windows
-        window_dur = MOVINET_WINDOW / VIDEO_ANALYSIS_FPS
-        return empty_scores, empty_dominant, window_dur
+        return empty_scores, ["none"] * n_windows, window_dur
+
+    if not frames:
+        empty_scores = {cat: [0.0] for cat in ALL_ACTION_CATEGORIES}
+        return empty_scores, ["none"], window_dur
 
     import tensorflow as tf
 
-    # ── Extract frames at analysis FPS ───────────────────
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        logger.warning("Cannot open video for action classification: %s", video_path)
-        n_windows = max(1, int(duration / (MOVINET_WINDOW / VIDEO_ANALYSIS_FPS)))
-        empty_scores = {cat: [0.0] * n_windows for cat in ALL_ACTION_CATEGORIES}
-        return empty_scores, ["none"] * n_windows, MOVINET_WINDOW / VIDEO_ANALYSIS_FPS
-
-    vid_fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-    frame_step = max(1, int(round(vid_fps / VIDEO_ANALYSIS_FPS)))
-
-    frames: list[np.ndarray] = []
-    frame_idx = 0
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        if frame_idx % frame_step == 0:
-            # Resize to MoViNet input size and normalise to [0, 1]
-            resized = cv2.resize(frame, (MOVINET_SIZE, MOVINET_SIZE))
-            resized = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
-            frames.append(resized.astype(np.float32) / 255.0)
-        frame_idx += 1
-    cap.release()
-
-    if not frames:
-        n_windows = 1
-        empty_scores = {cat: [0.0] for cat in ALL_ACTION_CATEGORIES}
-        return empty_scores, ["none"], MOVINET_WINDOW / VIDEO_ANALYSIS_FPS
-
     # ── Classify in sliding windows ──────────────────────
-    window_dur = MOVINET_WINDOW / VIDEO_ANALYSIS_FPS
     step = max(1, MOVINET_WINDOW // 2)  # 50% overlap
 
     action_scores: dict[str, list[float]] = {cat: [] for cat in ALL_ACTION_CATEGORIES}
@@ -488,8 +465,11 @@ def _classify_actions(
         while len(window) < MOVINET_WINDOW:
             window.append(window[-1])
 
+        # Convert uint8 → float32 [0, 1] only at inference time
         # [1, N, H, W, 3]
-        batch = np.expand_dims(np.stack(window), axis=0)
+        batch = np.expand_dims(
+            np.stack(window).astype(np.float32) / 255.0, axis=0,
+        )
         input_tensor = tf.constant(batch, dtype=tf.float32)
 
         try:
