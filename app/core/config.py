@@ -74,6 +74,19 @@ class Settings(BaseSettings):
     HAPTIC_CURVE_VARIANCE_THRESHOLD: float = 0.03
     HAPTIC_REST_INTENSITY_THRESHOLD: float = 0.02
 
+    # ── Transient "thud" duration (E2) ───────────────────
+    # HapticTransient events are zero-duration impulses on iOS, which can
+    # feel clinical for low-sharpness ("thud") taps.  When a transient's
+    # sharpness is below TRANSIENT_THUD_SHARPNESS_THRESHOLD it is emitted
+    # instead as a short HapticContinuous with EventDuration linearly
+    # mapped from sharpness:
+    #   sharpness = 0.0       → THUD_DURATION_MAX_S (deepest thud)
+    #   sharpness = threshold → THUD_DURATION_MIN_S (borderline)
+    # Sharper transients stay as zero-duration HapticTransient impulses.
+    TRANSIENT_THUD_SHARPNESS_THRESHOLD: float = 0.40
+    TRANSIENT_THUD_DURATION_MIN_S: float = 0.020
+    TRANSIENT_THUD_DURATION_MAX_S: float = 0.060
+
     YAMNET_MODEL_HANDLE: str = "https://tfhub.dev/google/yamnet/1"
 
     WHISPER_MODEL_SIZE: str = "tiny"

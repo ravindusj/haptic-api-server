@@ -365,19 +365,50 @@ def _make_transient(
     intensity: float,
     sharpness: float,
 ) -> dict[str, Any]:
+    """Emit a single tap event.
+
+    Sharp taps (sharpness >= TRANSIENT_THUD_SHARPNESS_THRESHOLD) are
+    encoded as HapticTransient — zero-duration impulses, ideal for
+    crisp clicks, snare hits, gunshots, glass shatter.
+
+    Dull taps (low sharpness — bass thuds, body slams, deep impacts)
+    are emitted as a short HapticContinuous with EventDuration mapped
+    from sharpness.  HapticTransient on iOS is a true impulse with no
+    user-controllable duration, so low-sharpness "thuds" feel clinical;
+    a short continuous event gives the body of the haptic time to
+    register on the Taptic Engine, producing the heavier, thuddier
+    feel users associate with deep impacts.
+    """
+    s = max(0.0, min(1.0, sharpness))
+    i = max(0.0, min(1.0, intensity))
+    thud_threshold = settings.TRANSIENT_THUD_SHARPNESS_THRESHOLD
+
+    if s >= thud_threshold:
+        return {
+            "Event": {
+                "Time": time,
+                "EventType": "HapticTransient",
+                "EventParameters": [
+                    {"ParameterID": "HapticIntensity", "ParameterValue": round(i, 3)},
+                    {"ParameterID": "HapticSharpness", "ParameterValue": round(s, 3)},
+                ],
+            }
+        }
+
+    # Below threshold → short HapticContinuous thud.
+    # Linear map: s=0 → max duration, s=threshold → min duration.
+    d_min = settings.TRANSIENT_THUD_DURATION_MIN_S
+    d_max = settings.TRANSIENT_THUD_DURATION_MAX_S
+    frac = s / thud_threshold if thud_threshold > 0 else 0.0
+    duration = d_max + (d_min - d_max) * frac
     return {
         "Event": {
             "Time": time,
-            "EventType": "HapticTransient",
+            "EventType": "HapticContinuous",
+            "EventDuration": round(duration, 3),
             "EventParameters": [
-                {
-                    "ParameterID": "HapticIntensity",
-                    "ParameterValue": round(intensity, 3),
-                },
-                {
-                    "ParameterID": "HapticSharpness",
-                    "ParameterValue": round(sharpness, 3),
-                },
+                {"ParameterID": "HapticIntensity", "ParameterValue": round(i, 3)},
+                {"ParameterID": "HapticSharpness", "ParameterValue": round(s, 3)},
             ],
         }
     }

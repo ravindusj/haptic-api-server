@@ -25,19 +25,80 @@ _DRUM_LABELS_SET: set[str] = {
     "Drum roll", "Cymbal", "Hi-hat", "Drum kit",
 }
 
+# Impact labels — these always override speech suppression during dialogue.
+# AudioSet/YAMNet display-name strings. Membership here means:
+#   1. Bypasses the speech gate (haptic_override).
+#   2. Allows the per-class burst template to fire even when ai_haptic < 0.15
+#      (most new entries aren't in HAPTIC_WORTHY_CLASSES yet, so their
+#      ai_haptic score stays low — label-based fallback ensures they fire).
 _IMPACT_LABELS_SET: set[str] = {
+    # Core impacts (original)
     "Explosion", "Gunshot, gunfire", "Machine gun", "Fusillade",
     "Artillery fire", "Smash, crash", "Thump, thud", "Bang",
     "Whack, thwack", "Slap, smack", "Thunder", "Thunderstorm",
+    # Glass / breaking
+    "Shatter", "Glass", "Chink, clink",
+    # Wood / surface breaking
+    "Crack", "Snap", "Splinter", "Crunch", "Wood", "Chop", "Tearing",
+    # Water / liquid impacts
+    "Splash, splatter",
+    # Doors / heavy strikes
+    "Slam", "Door",
+    # Mechanical impacts
+    "Hammer", "Jackhammer", "Boom",
+    # Pyrotechnics / bursts
+    "Fireworks", "Firecracker", "Eruption", "Burst, pop", "Pop", "Crackle",
+    # Sharp crack
+    "Whip",
+    # Vehicle action
+    "Skidding", "Tire squeal",
+    # Distinct strikes
+    "Drill", "Power tool",
 }
 
+# Per-class impact authoring template.  Each template is a dict with:
+#   "taps":  list[tuple[offset_ms, intensity_scale, sharpness]]
+#   "pre":   optional tuple(offset_ms, intensity_scale, sharpness) — emitted BEFORE t
+#   "tail":  optional tuple(duration_s, peak_intensity, decay_tau_s, sharpness)
+# offset_ms is relative to the impact frame time t. intensity_scale multiplies
+# the per-frame base intensity. sharpness is absolute.
 _IMPACT_TEMPLATES: dict[str, dict] = {
+    # ── Explosive / pyrotechnic ────────────────────────────
     "Explosion": {
         "taps":  [(0, 1.00, 0.95), (30, 0.75, 0.80),
                   (65, 0.50, 0.55), (110, 0.30, 0.30), (160, 0.15, 0.15)],
         "pre":   (180, 0.30, 0.40),
         "tail":  (1.20, 0.55, 0.45, 0.15),
     },
+    "Eruption": {
+        "taps":  [(0, 1.00, 0.55), (60, 0.80, 0.40), (140, 0.55, 0.30)],
+        "tail":  (2.20, 0.70, 0.90, 0.10),
+    },
+    "Boom": {
+        "taps":  [(0, 1.00, 0.45), (45, 0.65, 0.30)],
+        "tail":  (1.00, 0.55, 0.50, 0.10),
+    },
+    "Fireworks": {
+        "taps":  [(0, 0.90, 0.85), (90, 0.65, 0.75),
+                  (200, 0.50, 0.65), (340, 0.35, 0.45)],
+        "tail":  (0.60, 0.30, 0.30, 0.40),
+    },
+    "Firecracker": {
+        "taps":  [(0, 0.85, 0.90), (40, 0.55, 0.80), (95, 0.30, 0.55)],
+    },
+    "Burst, pop": {
+        "taps":  [(0, 0.85, 0.85), (35, 0.45, 0.55)],
+    },
+    "Pop": {
+        "taps":  [(0, 0.75, 0.85)],
+    },
+    "Crackle": {
+        # rapid micro-taps — campfire crackle / electrical crackle
+        "taps":  [(0, 0.55, 0.85), (35, 0.45, 0.80),
+                  (70, 0.40, 0.75), (115, 0.35, 0.75), (170, 0.30, 0.70)],
+    },
+
+    # ── Weather ────────────────────────────────────────────
     "Thunder": {
         "taps":  [(0, 1.00, 0.70), (45, 0.60, 0.45), (105, 0.35, 0.20)],
         "tail":  (1.80, 0.50, 0.65, 0.10),
@@ -46,6 +107,8 @@ _IMPACT_TEMPLATES: dict[str, dict] = {
         "taps":  [(0, 1.00, 0.70), (45, 0.60, 0.45), (105, 0.35, 0.20)],
         "tail":  (1.80, 0.50, 0.65, 0.10),
     },
+
+    # ── Weapons / gunfire ─────────────────────────────────
     "Gunshot, gunfire": {
         "taps":  [(0, 1.00, 1.00), (15, 0.55, 0.85)],
     },
@@ -55,6 +118,11 @@ _IMPACT_TEMPLATES: dict[str, dict] = {
         "taps":  [(0, 1.00, 0.85), (35, 0.70, 0.65), (80, 0.45, 0.40)],
         "tail":  (1.00, 0.55, 0.40, 0.15),
     },
+    "Cap gun": {
+        "taps":  [(0, 0.80, 0.90)],
+    },
+
+    # ── Crashes / smashes ─────────────────────────────────
     "Smash, crash": {
         "taps":  [(0, 1.00, 0.95), (28, 0.75, 0.90), (60, 0.55, 0.85),
                   (100, 0.40, 0.75), (150, 0.25, 0.55), (210, 0.15, 0.35),
@@ -65,16 +133,139 @@ _IMPACT_TEMPLATES: dict[str, dict] = {
         "taps":  [(0, 1.00, 0.85), (40, 0.50, 0.55), (95, 0.20, 0.25)],
         "tail":  (0.45, 0.35, 0.25, 0.20),
     },
+
+    # ── Strikes ───────────────────────────────────────────
     "Thump, thud": {
         "taps":  [(0, 1.00, 0.55), (50, 0.45, 0.30)],
         "tail":  (0.55, 0.40, 0.25, 0.10),
     },
     "Whack, thwack": {"taps": [(0, 1.00, 0.85), (28, 0.45, 0.65)]},
     "Slap, smack":   {"taps": [(0, 1.00, 0.80), (25, 0.40, 0.60)]},
+    "Hammer": {
+        "taps":  [(0, 0.95, 0.75), (40, 0.40, 0.55)],
+        "tail":  (0.35, 0.30, 0.20, 0.20),
+    },
+    "Jackhammer": {
+        # Rapid-fire heavy mechanical
+        "taps":  [(0, 1.00, 0.65)],
+    },
+    "Whip": {
+        "taps":  [(0, 0.95, 0.95), (20, 0.40, 0.85)],
+    },
+
+    # ── Glass / breaking ──────────────────────────────────
+    "Shatter": {
+        # bright, dense crackle — many small sharp taps
+        "taps":  [(0, 1.00, 0.95), (25, 0.80, 0.90), (55, 0.65, 0.85),
+                  (95, 0.50, 0.80), (145, 0.40, 0.75),
+                  (210, 0.30, 0.70), (290, 0.20, 0.60)],
+    },
+    "Glass": {
+        "taps":  [(0, 0.85, 0.90), (45, 0.55, 0.80), (110, 0.30, 0.65)],
+    },
+    "Chink, clink": {
+        "taps":  [(0, 0.65, 0.95)],
+    },
+
+    # ── Wood / surface breaking ───────────────────────────
+    "Crack": {
+        "taps":  [(0, 0.90, 0.85), (35, 0.45, 0.65)],
+    },
+    "Snap": {
+        "taps":  [(0, 0.80, 0.90)],
+    },
+    "Splinter": {
+        # multi-tap dense burst — splintering wood
+        "taps":  [(0, 0.85, 0.85), (30, 0.65, 0.80),
+                  (70, 0.50, 0.75), (125, 0.35, 0.65), (195, 0.20, 0.50)],
+    },
+    "Crunch": {
+        "taps":  [(0, 0.70, 0.60), (45, 0.50, 0.50), (100, 0.30, 0.40)],
+    },
+    "Wood": {
+        "taps":  [(0, 0.75, 0.55), (40, 0.40, 0.40)],
+    },
+    "Chop": {
+        "taps":  [(0, 0.85, 0.70)],
+    },
+    "Tearing": {
+        "taps":  [(0, 0.55, 0.70), (60, 0.50, 0.65), (130, 0.45, 0.60)],
+    },
+
+    # ── Water / liquid ────────────────────────────────────
+    "Splash, splatter": {
+        # soft thud + drip taps (E1 example from research notes)
+        "taps":  [(0, 0.85, 0.35), (60, 0.45, 0.55),
+                  (120, 0.30, 0.50), (200, 0.20, 0.45)],
+        "tail":  (0.50, 0.25, 0.30, 0.30),
+    },
+
+    # ── Doors / heavy strikes ─────────────────────────────
+    "Slam": {
+        # low thud + reverb tail (door slam)
+        "taps":  [(0, 1.00, 0.55), (45, 0.55, 0.40), (110, 0.30, 0.25)],
+        "tail":  (0.80, 0.50, 0.40, 0.10),
+    },
+    "Door": {
+        "taps":  [(0, 0.80, 0.60), (50, 0.40, 0.45)],
+        "tail":  (0.45, 0.30, 0.25, 0.15),
+    },
+
+    # ── Vehicle / mechanical action ───────────────────────
+    "Skidding": {
+        # sustained high-sharpness buzz then thud at end
+        "taps":  [(0, 0.70, 0.85), (180, 0.60, 0.80),
+                  (360, 0.55, 0.75)],
+        "tail":  (0.80, 0.45, 0.60, 0.70),
+    },
+    "Tire squeal": {
+        "taps":  [(0, 0.65, 0.90), (160, 0.55, 0.85)],
+        "tail":  (0.60, 0.40, 0.45, 0.80),
+    },
+    "Drill": {
+        "taps":  [(0, 0.65, 0.75)],
+    },
+    "Power tool": {
+        "taps":  [(0, 0.60, 0.70)],
+    },
 }
 
 _IMPACT_TEMPLATE_DEFAULT: dict = {
     "taps": [(0, 1.00, 0.95), (30, 0.70, 0.60), (60, 0.40, 0.25)],
+}
+
+# Single source of truth for which dominant-class labels trigger per-class
+# burst authoring (taps + optional pre / tail).  Derived directly from
+# the template keys so adding a template automatically enables it.
+_BURST_CLASSES: set[str] = set(_IMPACT_TEMPLATES.keys())
+
+# Rapid-fire / sustained percussion classes use a shorter burst cooldown
+# (120 ms instead of 500 ms) so the cadence stays tight.
+_RAPID_FIRE_CLASSES: set[str] = {
+    "Machine gun", "Fusillade", "Artillery fire",
+    "Jackhammer", "Drill", "Power tool", "Crackle", "Firecracker",
+}
+
+# ── Semantic sharpness label sets (used in band-balance blending) ──
+_CRASH_LABELS: set[str] = {
+    "Explosion", "Eruption", "Smash, crash", "Bang", "Thunder",
+    "Thunderstorm", "Thump, thud", "Whack, thwack", "Slap, smack",
+    "Artillery fire", "Slam", "Door", "Hammer", "Boom",
+    "Shatter", "Glass", "Crack", "Snap", "Splinter", "Crunch",
+    "Wood", "Chop", "Tearing", "Splash, splatter",
+    "Fireworks", "Firecracker", "Burst, pop", "Pop",
+}
+_GUNSHOT_LABELS: set[str] = {
+    "Gunshot, gunfire", "Machine gun", "Fusillade", "Cap gun", "Whip",
+}
+_DEEP_LABELS: set[str] = {
+    "Bass guitar", "Double bass", "Engine", "Motor vehicle (road)",
+    "Truck", "Boom", "Eruption", "Heart sounds, heartbeat",
+    "Subway, metro, underground",
+}
+_TICK_LABELS: set[str] = {
+    "Clock", "Tick", "Tick-tock", "Alarm clock",
+    "Chink, clink", "Crackle",
 }
 
 
@@ -440,18 +631,9 @@ def fuse_scores(
     sharpness_smooth_win = max(1, int(0.05 / frame_dur))
     sharpness = _smooth(sharpness, sharpness_smooth_win)
 
-    _CRASH_LABELS = {
-        "Explosion", "Smash, crash", "Bang", "Thunder",
-        "Thunderstorm", "Thump, thud", "Whack, thwack",
-        "Slap, smack", "Artillery fire",
-    }
-    _GUNSHOT_LABELS = {"Gunshot, gunfire", "Machine gun", "Fusillade"}
-    _DRUM_LABELS = _DRUM_LABELS_SET
-    _DEEP_LABELS = {
-        "Bass guitar", "Double bass", "Engine",
-        "Motor vehicle (road)", "Truck",
-    }
-    _TICK_LABELS = {"Clock", "Tick", "Tick-tock", "Alarm clock"}
+    # Semantic sharpness labels are now module-level constants
+    # (_CRASH_LABELS, _GUNSHOT_LABELS, _DEEP_LABELS, _TICK_LABELS)
+    # so the expanded sets stay in one place.
     if _ai_n > 0:
         _sem_sharp = np.full(_ai_n, 0.5)
         for _si, _lbl in enumerate(ai.dominant_classes):
@@ -461,7 +643,7 @@ def fuse_scores(
                 _sem_sharp[_si] = 0.95
             elif _lbl in _TICK_LABELS:
                 _sem_sharp[_si] = 0.90
-            elif _lbl in _DRUM_LABELS:
+            elif _lbl in _DRUM_LABELS_SET:
                 _sem_sharp[_si] = 0.60
             elif _lbl in _DEEP_LABELS:
                 _sem_sharp[_si] = 0.15
@@ -483,19 +665,17 @@ def fuse_scores(
         _sharp_tau = settings.IMPACT_SHARPNESS_DECAY_S
         _sharp_n = max(1, int((_sharp_tau * 5.0) / frame_dur))
         _last_tail_t = -1.0
-        _BURST_CLASSES_LOCAL = {
-            "Explosion", "Smash, crash", "Bang", "Thunder",
-            "Thunderstorm", "Gunshot, gunfire", "Machine gun",
-            "Fusillade", "Artillery fire", "Thump, thud",
-            "Whack, thwack", "Slap, smack",
-        }
         for _fi in range(n_frames):
-            if ai_haptic[_fi] < 0.15:
+            _lbl = dsp_dominant[_fi]
+            # Allow burst-tail authoring whenever the dominant class is a
+            # known impact label, even if YAMNet's overall haptic score is
+            # low (newly added classes often aren't in HAPTIC_WORTHY_CLASSES
+            # yet, so ai_haptic stays low even for confident detections).
+            if ai_haptic[_fi] < 0.15 and _lbl not in _IMPACT_LABELS_SET:
                 continue
             if combined[_fi] < threshold * 0.5:
                 continue
-            _lbl = dsp_dominant[_fi]
-            if _lbl not in _BURST_CLASSES_LOCAL:
+            if _lbl not in _BURST_CLASSES:
                 continue
             _t_now = _fi * frame_dur
             if (_t_now - _last_tail_t) < 0.40:
@@ -728,21 +908,20 @@ def _extract_transient_events(
             )
         )
 
-    _BURST_CLASSES = {
-        "Explosion", "Smash, crash", "Bang", "Thunder",
-        "Thunderstorm", "Gunshot, gunfire", "Machine gun",
-        "Fusillade", "Artillery fire", "Thump, thud",
-        "Whack, thwack", "Slap, smack",
-    }
-    _RAPID_FIRE_CLASSES = {"Machine gun", "Fusillade", "Artillery fire"}
+    # _BURST_CLASSES and _RAPID_FIRE_CLASSES are module-level constants
+    # derived from _IMPACT_TEMPLATES so the burst extractor automatically
+    # picks up every template added to the dict.
     if ai_haptic is not None and dsp_dominant is not None:
         last_burst_t = -1.0
         for fi in range(n_frames):
             if fi >= len(ai_haptic) or fi >= len(dsp_dominant):
                 break
-            if ai_haptic[fi] < 0.15:
-                continue
             lbl = dsp_dominant[fi]
+            # Allow firing for known impact labels even when ai_haptic is low —
+            # newly-added classes may not yet be in HAPTIC_WORTHY_CLASSES,
+            # which keeps their ai_haptic contribution near zero.
+            if ai_haptic[fi] < 0.15 and lbl not in _IMPACT_LABELS_SET:
+                continue
             if lbl not in _BURST_CLASSES:
                 continue
             if combined[fi] < threshold * 0.5:
