@@ -1,19 +1,3 @@
-"""Video-based action recognition and motion detection for haptic generation.
-
-Two complementary analysis tiers:
-
-1. **Optical Flow (OpenCV)** — lightweight frame-differencing and dense
-   optical flow to produce a per-frame motion intensity signal.  Catches
-   all fast action (chases, crashes, falls) regardless of semantic label.
-   Also detects scene cuts via sudden frame-difference spikes.
-
-2. **MoViNet-A0 (TensorFlow)** — Google's Mobile Video Network for
-   action classification on Kinetics-600 classes.  Runs on CPU using
-   the existing TensorFlow installation (~3 M params, 20 MB).
-   Provides semantic action labels mapped to six haptic scenario
-   categories: IMPACT, CHASE, CRASH, FALL, DRIVING, SPORTS_HIT.
-"""
-
 from __future__ import annotations
 
 import logging
@@ -30,106 +14,38 @@ from app.models.schemas import SceneChange, VideoFeatures
 logger = logging.getLogger(__name__)
 settings = get_settings()
 
-# ── MoViNet singleton ────────────────────────────────────
-
 _movinet_model: Any | None = None
 
-# ── Analysis FPS (frames sampled per second of video) ────
 VIDEO_ANALYSIS_FPS: float = 5.0
 
-# ── MoViNet input resolution ────────────────────────────
 MOVINET_SIZE: int = 172
-MOVINET_WINDOW: int = 16       # frames per classification window
+MOVINET_WINDOW: int = 16
 MOVINET_HUB_URL: str = (
     "https://www.kaggle.com/models/google/movinet/"
     "TensorFlow2/a0-base-kinetics-600-classification/3"
 )
 
-# ── Kinetics-600 label file ──────────────────────────────
 _kinetics_labels: list[str] | None = None
 
-# ── Haptic scenario category mappings (Kinetics-600 indices) ─
-
 IMPACT_INDICES: set[int] = {
-    4,    # alligator wrestling
-    11,   # arm wrestling
-    58,   # bull fighting
-    177,  # fencing (sport)
-    209,  # headbutting
-    211,  # high kick
-    319,  # pillow fight
-    390,  # punching bag
-    391,  # punching person (boxing)
-    458,  # side kick
-    472,  # slapping
-    475,  # smashing
-    511,  # sword fighting
-    513,  # tackling
-    594,  # wrestling
+    4, 11, 58, 177, 209, 211, 319, 390, 391, 458, 472, 475, 511, 513, 594,
 }
 
-CHASE_INDICES: set[int] = {
-    236,  # jogging
-    307,  # parkour
-    427,  # running on treadmill
-}
+CHASE_INDICES: set[int] = {236, 307, 427}
 
-CRASH_INDICES: set[int] = {
-    59,   # bulldozing
-    67,   # capsizing
-    475,  # smashing (also IMPACT — dual-mapped)
-}
+CRASH_INDICES: set[int] = {59, 67, 475}
 
 FALL_INDICES: set[int] = {
-    17,   # backflip (human)
-    22,   # base jumping
-    60,   # bungee jumping
-    71,   # cartwheeling
-    139,  # diving cliff
-    171,  # faceplanting
-    172,  # falling off bike
-    173,  # falling off chair
-    204,  # gymnastics tumbling
-    210,  # high jump
-    240,  # jumping bicycle
-    241,  # jumping into pool
-    263,  # long jump
-    381,  # pole vault
-    464,  # ski jumping
-    470,  # skydiving
-    486,  # somersaulting
-    490,  # springboard diving
-    545,  # triple jump
+    17, 22, 60, 71, 139, 171, 172, 173, 204, 210, 240,
+    241, 263, 381, 464, 470, 486, 490, 545,
 }
 
-DRIVING_INDICES: set[int] = {
-    149,  # driving car
-    150,  # driving tractor
-    235,  # jetskiing
-    253,  # lawn mower racing
-    292,  # motorcycling
-    409,  # riding a bike
-    415,  # riding scooter
-}
+DRIVING_INDICES: set[int] = {149, 150, 235, 253, 292, 409, 415}
 
 SPORTS_HIT_INDICES: set[int] = {
-    76,   # catching or throwing baseball
-    197,  # golf chipping
-    198,  # golf driving
-    199,  # golf putting
-    205,  # hammer throw
-    213,  # hitting baseball
-    224,  # hurling (sport)
-    336,  # playing cricket
-    342,  # playing field hockey
-    349,  # playing ice hockey
-    372,  # playing tennis
-    450,  # shooting basketball
-    453,  # shot put
-    509,  # swinging baseball bat
+    76, 197, 198, 199, 205, 213, 224, 336, 342, 349, 372, 450, 453, 509,
 }
 
-# All category mappings as {index → category_name}
 _CATEGORY_MAP: dict[int, str] = {}
 for _idx in IMPACT_INDICES:
     _CATEGORY_MAP[_idx] = "impact"
@@ -147,27 +63,12 @@ for _idx in SPORTS_HIT_INDICES:
 ALL_ACTION_CATEGORIES = ["impact", "chase", "crash", "fall", "driving", "sports_hit"]
 
 
-# ── Public API ───────────────────────────────────────────
-
-
 def analyze_video(video_path: str) -> VideoFeatures:
-    """Run full video analysis: motion detection + action recognition.
-
-    Parameters
-    ----------
-    video_path : str
-        Path to the original video file.
-
-    Returns
-    -------
-    VideoFeatures
-        Per-window motion intensity, scene changes, and action scores.
-    """
+    """Run optical flow motion detection + MoViNet action recognition on a video."""
     video_path = str(video_path)
     duration = _get_duration(video_path)
     logger.info("Video analysis: %.2fs video at %s", duration, video_path)
 
-    # ── Single decode pass: motion features + MoViNet input ──
     (motion_intensity, scene_changes, visual_flash, camera_shake,
      movinet_frames) = _decode_and_compute_motion(video_path)
 
@@ -180,7 +81,6 @@ def analyze_video(video_path: str) -> VideoFeatures:
         float(np.max(motion_intensity)) if motion_intensity else 0.0,
     )
 
-    # ── Tier 2: MoViNet action recognition (reuses decoded frames) ──
     action_scores, dominant_actions, window_dur = _classify_actions(
         movinet_frames, duration,
     )
@@ -205,30 +105,10 @@ def analyze_video(video_path: str) -> VideoFeatures:
     )
 
 
-# ── Single-pass decode: motion features + MoViNet input ──
-
-
 def _decode_and_compute_motion(
     video_path: str,
 ) -> tuple[list[float], list[SceneChange], list[float], list[float], list[np.ndarray]]:
-    """Decode the video once and produce both motion features and
-    MoViNet input frames.
-
-    Previously the video was opened twice — once for optical flow and
-    once for MoViNet — doubling decode cost.  This pass samples each
-    target frame exactly once and emits:
-
-      * Resized grayscale (320 wide) → optical flow / scene cuts / luma
-      * Resized RGB uint8 (MOVINET_SIZE²) → cached for MoViNet inference
-
-    The MoViNet buffer is kept as uint8 to limit memory; conversion to
-    float32 happens per-window inside ``_classify_actions``.
-
-    Returns
-    -------
-    motion_intensity, scene_changes, visual_flash, camera_shake,
-    movinet_frames
-    """
+    """Single decode pass producing optical flow features and MoViNet input frames."""
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         logger.warning("Cannot open video: %s", video_path)
@@ -236,7 +116,6 @@ def _decode_and_compute_motion(
 
     vid_fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
 
-    # Compute frame step to achieve target analysis FPS
     frame_step = max(1, int(round(vid_fps / VIDEO_ANALYSIS_FPS)))
 
     prev_gray: np.ndarray | None = None
@@ -254,12 +133,10 @@ def _decode_and_compute_motion(
             break
 
         if frame_idx % frame_step == 0:
-            # ── MoViNet input: resize once, store as uint8 RGB ──
             mv = cv2.resize(frame, (MOVINET_SIZE, MOVINET_SIZE))
             mv = cv2.cvtColor(mv, cv2.COLOR_BGR2RGB)
-            movinet_frames.append(mv)  # uint8, ~88 KB per frame
+            movinet_frames.append(mv)
 
-            # ── Motion input: resize to 320 wide, grayscale ──
             h, w = frame.shape[:2]
             scale = 320.0 / max(w, 1)
             small = cv2.resize(frame, (320, max(1, int(h * scale))))
@@ -268,7 +145,6 @@ def _decode_and_compute_motion(
             t = frame_idx / vid_fps
 
             if prev_gray is not None:
-                # Dense optical flow (Farneback)
                 flow = cv2.calcOpticalFlowFarneback(
                     prev_gray, gray, None,
                     pyr_scale=0.5, levels=3, winsize=15,
@@ -299,14 +175,12 @@ def _decode_and_compute_motion(
     if not raw_magnitudes:
         return [], [], [], [], movinet_frames
 
-    # Normalise motion to 0-1
     raw_arr = np.array(raw_magnitudes, dtype=np.float64)
     peak = np.percentile(raw_arr, 99) if len(raw_arr) > 0 else 1.0
     if peak > 1e-6:
         raw_arr /= peak
     motion_intensity = [round(float(np.clip(v, 0.0, 1.0)), 4) for v in raw_arr]
 
-    # Detect scene changes: frame diff > 3× rolling median
     scene_changes: list[SceneChange] = []
     if frame_diffs:
         diff_arr = np.array(frame_diffs)
@@ -319,25 +193,21 @@ def _decode_and_compute_motion(
                     magnitude=round(float(d / threshold), 3),
                 ))
 
-    # ── V1: Visual flash via brightness-spike vs rolling baseline ──
-    # Frame-relative measure: (luma - rolling_median) / rolling_median.
-    # Robust to lighting; spikes only on sudden brightenings.
+    # Visual flash: brightness spike relative to rolling median baseline.
     visual_flash: list[float] = []
     if luma_vals:
         luma_arr = np.array(luma_vals, dtype=np.float64)
-        win = max(3, int(round(VIDEO_ANALYSIS_FPS * 0.6)))  # ~600ms baseline
+        win = max(3, int(round(VIDEO_ANALYSIS_FPS * 0.6)))
         pad = win // 2
         padded = np.pad(luma_arr, pad, mode="edge")
         baseline = np.array([
             np.median(padded[i:i + win]) for i in range(len(luma_arr))
         ])
-        eps = 1.0  # avoid div-by-zero on very dark frames
+        eps = 1.0
         rel = (luma_arr - baseline) / np.maximum(baseline, eps)
         visual_flash = [round(float(np.clip(v, 0.0, 1.0)), 4) for v in rel]
 
-    # ── V2: Camera shake from global translation magnitude ─────────
-    # Normalised by 99th percentile so a few violent shakes don't
-    # compress the rest of the signal to near-zero.
+    # Camera shake: normalised global translation magnitude.
     camera_shake: list[float] = []
     if global_trans:
         trans_arr = np.array(global_trans, dtype=np.float64)
@@ -355,9 +225,6 @@ def _decode_and_compute_motion(
     )
 
     return motion_intensity, scene_changes, visual_flash, camera_shake, movinet_frames
-
-
-# ── Tier 2: MoViNet action classification ───────────────
 
 
 def _load_movinet():
@@ -381,19 +248,17 @@ def _load_movinet():
 
 
 def _load_kinetics_labels() -> list[str]:
-    """Load Kinetics-600 class labels (cached)."""
+    """Load Kinetics-600 class labels (cached locally after first download)."""
     global _kinetics_labels
 
     if _kinetics_labels is not None:
         return _kinetics_labels
 
-    # Try loading from bundled file first
     label_path = Path(__file__).parent.parent / "data" / "kinetics_600_labels.txt"
     if label_path.exists():
         _kinetics_labels = label_path.read_text().strip().split("\n")
         return _kinetics_labels
 
-    # Fallback: download
     try:
         import urllib.request
         url = (
@@ -405,7 +270,6 @@ def _load_kinetics_labels() -> list[str]:
         text = response.read().decode("utf-8")
         _kinetics_labels = text.strip().split("\n")
 
-        # Cache locally
         label_path.parent.mkdir(parents=True, exist_ok=True)
         label_path.write_text(text)
         logger.info("Kinetics-600 labels downloaded and cached (%d labels)", len(_kinetics_labels))
@@ -419,26 +283,11 @@ def _classify_actions(
     frames: list[np.ndarray],
     duration: float,
 ) -> tuple[dict[str, list[float]], list[str], float]:
-    """Classify video actions using MoViNet-A0.
-
-    Consumes the pre-decoded MoViNet input frames produced by
-    ``_decode_and_compute_motion`` (uint8 RGB at MOVINET_SIZE²).
-    Processes them in sliding windows of MOVINET_WINDOW frames.
-
-    Returns
-    -------
-    action_scores : dict[str, list[float]]
-        Per-window scores for each haptic category (0-1).
-    dominant_actions : list[str]
-        The dominant haptic category per window.
-    window_duration_s : float
-        Duration of each classification window in seconds.
-    """
+    """Classify video actions using MoViNet-A0 (sliding 16-frame windows, 50% overlap)."""
     model = _load_movinet()
     labels = _load_kinetics_labels()
     window_dur = MOVINET_WINDOW / VIDEO_ANALYSIS_FPS
 
-    # If model failed to load, return motion-only fallback
     if model is None:
         n_windows = max(1, int(duration / window_dur))
         empty_scores = {cat: [0.0] * n_windows for cat in ALL_ACTION_CATEGORIES}
@@ -450,34 +299,28 @@ def _classify_actions(
 
     import tensorflow as tf
 
-    # ── Classify in sliding windows ──────────────────────
-    step = max(1, MOVINET_WINDOW // 2)  # 50% overlap
+    step = max(1, MOVINET_WINDOW // 2)
 
     action_scores: dict[str, list[float]] = {cat: [] for cat in ALL_ACTION_CATEGORIES}
     dominant_actions: list[str] = []
 
     for start in range(0, len(frames), step):
         window = frames[start : start + MOVINET_WINDOW]
-        if len(window) < 4:  # too short for meaningful classification
+        if len(window) < 4:
             break
 
-        # Pad short windows by repeating last frame
         while len(window) < MOVINET_WINDOW:
             window.append(window[-1])
 
-        # Convert uint8 → float32 [0, 1] only at inference time
-        # [1, N, H, W, 3]
         batch = np.expand_dims(
             np.stack(window).astype(np.float32) / 255.0, axis=0,
         )
         input_tensor = tf.constant(batch, dtype=tf.float32)
 
         try:
-            # MoViNet forward pass
             logits = model(dict(image=input_tensor))
-            probs = tf.nn.softmax(logits, axis=-1).numpy()[0]  # (600,)
+            probs = tf.nn.softmax(logits, axis=-1).numpy()[0]
 
-            # Aggregate per-category scores
             window_scores: dict[str, float] = {}
             for cat in ALL_ACTION_CATEGORIES:
                 cat_indices = [i for i, c in _CATEGORY_MAP.items() if c == cat and i < len(probs)]
@@ -487,7 +330,6 @@ def _classify_actions(
                     window_scores[cat] = 0.0
                 action_scores[cat].append(round(window_scores[cat], 4))
 
-            # Dominant action = category with highest score (min threshold 0.05)
             best_cat = max(window_scores, key=window_scores.get)  # type: ignore
             if window_scores[best_cat] >= 0.05:
                 dominant_actions.append(best_cat)
@@ -514,11 +356,7 @@ def _classify_actions(
     return action_scores, dominant_actions, window_dur
 
 
-# ── Utilities ────────────────────────────────────────────
-
-
 def _get_duration(video_path: str) -> float:
-    """Return video duration in seconds via ffprobe."""
     cmd = [
         "ffprobe",
         "-v", "error",

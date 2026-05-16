@@ -1,5 +1,3 @@
-"""API routes for the Haptic Video Analyzer."""
-
 from __future__ import annotations
 
 import logging
@@ -29,9 +27,6 @@ settings = get_settings()
 router = APIRouter(prefix=settings.API_V1_PREFIX, tags=["haptic"])
 
 
-# ── POST /analyze ────────────────────────────────────────
-
-
 @router.post(
     "/analyze",
     response_model=JobCreatedResponse,
@@ -59,9 +54,6 @@ async def analyze_video(
         description="Bass energy multiplier: >1 = more rumble",
     ),
 ) -> JobCreatedResponse:
-    """Accept a video upload and queue it for haptic analysis."""
-
-    # ── Validate file ────────────────────────────────────
     if not file.filename:
         raise HTTPException(400, "No file uploaded.")
 
@@ -72,7 +64,6 @@ async def analyze_video(
             f"Unsupported format '{ext}'. Allowed: {settings.ALLOWED_EXTENSIONS}",
         )
 
-    # ── Generate job ID & save upload ────────────────────
     job_id = uuid.uuid4().hex[:12]
     upload_dir = Path(settings.UPLOAD_DIR) / job_id
     os.makedirs(upload_dir, exist_ok=True)
@@ -80,10 +71,9 @@ async def analyze_video(
     safe_name = f"{job_id}{ext}"
     video_path = str(upload_dir / safe_name)
 
-    # Stream file to disk (handles large files)
     file_size = 0
     with open(video_path, "wb") as f:
-        while chunk := await file.read(1024 * 1024):  # 1 MB chunks
+        while chunk := await file.read(1024 * 1024):
             file_size += len(chunk)
             if file_size > settings.MAX_UPLOAD_SIZE_MB * 1024 * 1024:
                 os.remove(video_path)
@@ -100,14 +90,12 @@ async def analyze_video(
         job_id,
     )
 
-    # ── Initialise job status ────────────────────────────
     _set_job_status(
         job_id, "queued", progress=0.0,
         file_name=file.filename,
         created_at=datetime.now(timezone.utc).isoformat(),
     )
 
-    # ── Dispatch Celery task ─────────────────────────────
     analyze_video_task.delay(
         job_id=job_id,
         video_path=video_path,
@@ -123,9 +111,6 @@ async def analyze_video(
     )
 
 
-# ── GET /status/{job_id} ─────────────────────────────────
-
-
 @router.get(
     "/status/{job_id}",
     response_model=JobStatusResponse,
@@ -133,7 +118,6 @@ async def analyze_video(
     summary="Check job processing status",
 )
 async def get_status(job_id: str) -> JobStatusResponse:
-    """Return the current processing status of a job."""
     data = get_job_status(job_id)
     if not data:
         raise HTTPException(404, f"Job '{job_id}' not found.")
@@ -150,9 +134,6 @@ async def get_status(job_id: str) -> JobStatusResponse:
     )
 
 
-# ── GET /result/{job_id} ─────────────────────────────────
-
-
 @router.get(
     "/result/{job_id}",
     dependencies=[Depends(verify_api_key)],
@@ -160,7 +141,6 @@ async def get_status(job_id: str) -> JobStatusResponse:
     description="Returns the .ahap file once processing is complete.",
 )
 async def download_result(job_id: str):
-    """Download the generated AHAP haptic pattern file."""
     data = get_job_status(job_id)
     if not data:
         raise HTTPException(404, f"Job '{job_id}' not found.")
@@ -183,9 +163,6 @@ async def download_result(job_id: str):
     )
 
 
-# ── GET /result/{job_id}/info ────────────────────────────
-
-
 @router.get(
     "/result/{job_id}/info",
     response_model=AHAPDownloadInfo,
@@ -193,7 +170,6 @@ async def download_result(job_id: str):
     summary="Get AHAP file metadata without downloading",
 )
 async def result_info(job_id: str) -> AHAPDownloadInfo:
-    """Return metadata about the generated AHAP file."""
     data = get_job_status(job_id)
     if not data:
         raise HTTPException(404, f"Job '{job_id}' not found.")
@@ -211,9 +187,6 @@ async def result_info(job_id: str) -> AHAPDownloadInfo:
     )
 
 
-# ── GET /preview/{job_id} ────────────────────────────────
-
-
 @router.get(
     "/preview/{job_id}",
     dependencies=[Depends(verify_api_key)],
@@ -224,7 +197,6 @@ async def result_info(job_id: str) -> AHAPDownloadInfo:
     ),
 )
 async def preview_timeline(job_id: str):
-    """Return a JSON timeline preview of haptic events."""
     import json
 
     data = get_job_status(job_id)
@@ -241,7 +213,6 @@ async def preview_timeline(job_id: str):
     with open(ahap_path) as f:
         ahap_data = json.load(f)
 
-    # Build a simplified preview
     preview_events = []
     intensity_curve: list[dict] = []
     sharpness_curve: list[dict] = []
@@ -281,9 +252,6 @@ async def preview_timeline(job_id: str):
     })
 
 
-# ── GET /visualize/{job_id} ──────────────────────────────
-
-
 @router.get(
     "/visualize/{job_id}",
     dependencies=[Depends(verify_api_key)],
@@ -302,7 +270,6 @@ async def preview_timeline(job_id: str):
     },
 )
 async def visualize_job(job_id: str):
-    """Generate and return a visual comparison graph as PNG."""
     from fastapi.responses import Response
     from app.services.visualizer import generate_visualization
 
@@ -331,12 +298,8 @@ async def visualize_job(job_id: str):
     )
 
 
-# ── GET /health ──────────────────────────────────────────
-
-
 @router.get("/health", tags=["system"], summary="Health check")
 async def health_check():
-    """Basic health check endpoint."""
     return {
         "status": "healthy",
         "service": settings.APP_NAME,

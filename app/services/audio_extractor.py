@@ -1,5 +1,3 @@
-"""Extract audio track from uploaded video files using FFmpeg."""
-
 from __future__ import annotations
 
 import logging
@@ -17,24 +15,7 @@ def extract_audio(
     video_path: str | Path,
     job_id: str,
 ) -> dict[str, str]:
-    """
-    Extract audio from a video file, producing two WAV files:
-
-    1. ``{job_id}_22050.wav`` – 22 050 Hz mono (for librosa DSP analysis)
-    2. ``{job_id}_16000.wav`` – 16 000 Hz mono (for YAMNet + Whisper)
-
-    Parameters
-    ----------
-    video_path : str | Path
-        Absolute path to the uploaded video.
-    job_id : str
-        Unique job identifier (used for output filenames).
-
-    Returns
-    -------
-    dict with keys ``"librosa_wav"`` and ``"classifier_wav"`` pointing to
-    the output file paths, plus ``"duration"`` in seconds.
-    """
+    """Extract audio from video, producing 22050 Hz (librosa) and 16000 Hz (YAMNet/Whisper) WAVs."""
     video_path = Path(video_path)
     if not video_path.exists():
         raise FileNotFoundError(f"Video not found: {video_path}")
@@ -45,14 +26,10 @@ def extract_audio(
     librosa_wav = str(work_dir / f"{job_id}_22050.wav")
     classifier_wav = str(work_dir / f"{job_id}_16000.wav")
 
-    # ── Get video duration ───────────────────────────────
     duration = _get_duration(str(video_path))
     logger.info("Video duration: %.2f seconds", duration)
 
-    # ── Extract at 22050 Hz (librosa) ────────────────────
     _ffmpeg_extract(str(video_path), librosa_wav, sample_rate=settings.AUDIO_SAMPLE_RATE)
-
-    # ── Extract at 16000 Hz (YAMNet + Whisper) ──────────
     _ffmpeg_extract(str(video_path), classifier_wav, sample_rate=settings.CLASSIFIER_SAMPLE_RATE)
 
     return {
@@ -67,15 +44,14 @@ def _ffmpeg_extract(
     output_path: str,
     sample_rate: int,
 ) -> None:
-    """Run FFmpeg to convert video → mono WAV at the given sample rate."""
     cmd = [
         "ffmpeg",
-        "-y",                     # overwrite
-        "-i", input_path,         # input video
-        "-vn",                    # drop video stream
-        "-acodec", "pcm_s16le",   # 16-bit PCM
-        "-ar", str(sample_rate),  # target sample rate
-        "-ac", "1",               # mono
+        "-y",
+        "-i", input_path,
+        "-vn",
+        "-acodec", "pcm_s16le",
+        "-ar", str(sample_rate),
+        "-ac", "1",
         output_path,
     ]
     logger.info("Running: %s", " ".join(cmd))
@@ -83,7 +59,7 @@ def _ffmpeg_extract(
         cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        timeout=600,  # 10 min max
+        timeout=600,
     )
     if result.returncode != 0:
         err = result.stderr.decode(errors="replace")
@@ -93,7 +69,6 @@ def _ffmpeg_extract(
 
 
 def _get_duration(video_path: str) -> float:
-    """Return video duration in seconds via ffprobe."""
     cmd = [
         "ffprobe",
         "-v", "error",
@@ -113,7 +88,6 @@ def _get_duration(video_path: str) -> float:
 
 
 def cleanup_job_files(job_id: str) -> None:
-    """Remove temporary audio files for a completed job."""
     import shutil
 
     work_dir = Path(settings.UPLOAD_DIR) / job_id

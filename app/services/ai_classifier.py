@@ -1,21 +1,3 @@
-"""AI-based sound event classification using YAMNet + faster-whisper.
-
-Two complementary models work together:
-
-1. **YAMNet** (Google, TensorFlow Hub) — classifies audio into 521
-   AudioSet classes at ~0.48 s hop.  Tiny MobileNet-v1 backbone (18 MB),
-   runs reliably on CPU, auto-cached.  Provides per-frame haptic-worthy
-   and speech scores.
-
-2. **faster-whisper** (CTranslate2) — state-of-the-art speech/dialogue
-   detection via the Whisper model.  Returns precise speech segment
-   timestamps.  Uses the ``tiny`` model (~75 MB, int8 quantised) on CPU.
-   No PyTorch dependency.
-
-Together they replace the old PANNs CNN14 (300 MB, frequently failed to
-load) and the unreliable DSP speech heuristic.
-"""
-
 from __future__ import annotations
 
 import csv
@@ -32,25 +14,19 @@ from app.models.schemas import AIClassification, SpeechSegment
 logger = logging.getLogger(__name__)
 settings = get_settings()
 
-# ── YAMNet AudioSet class indices (521 classes) ──────────
-
 HAPTIC_WORTHY_CLASSES: dict[int, tuple[str, float]] = {
-    # Explosions & impacts — weight 3.0 (must produce strong haptic)
     420: ("Explosion", 3.0),
     421: ("Gunshot, gunfire", 3.0),
     422: ("Machine gun", 3.0),
     423: ("Fusillade", 3.0),
     424: ("Artillery fire", 3.0),
-    # Crashes & breaking — weight 2.5–3.0
     463: ("Smash, crash", 3.0),
     454: ("Thump, thud", 2.5),
     460: ("Bang", 3.0),
     462: ("Whack, thwack", 2.5),
     464: ("Slap, smack", 2.0),
-    # Thunder — weight 3.0
     281: ("Thunder", 3.0),
     282: ("Thunderstorm", 3.0),
-    # Drums & percussion — weight 0.3 (suppressed: acoustic drums self-punch)
     159: ("Drum", 0.3),
     160: ("Snare drum", 0.3),
     163: ("Bass drum", 0.3),
@@ -59,9 +35,7 @@ HAPTIC_WORTHY_CLASSES: dict[int, tuple[str, float]] = {
     164: ("Cymbal", 0.3),
     165: ("Hi-hat", 0.3),
     166: ("Drum kit", 0.3),
-    # Bass & low-freq instruments — weight 1.5
     153: ("Bass guitar", 1.5),
-    # Guitar / strings — weight 1.0
     135: ("Guitar", 1.0),
     136: ("Electric guitar", 1.2),
     137: ("Acoustic guitar", 1.0),
@@ -72,21 +46,17 @@ HAPTIC_WORTHY_CLASSES: dict[int, tuple[str, float]] = {
     151: ("Mandolin", 1.0),
     152: ("Banjo", 1.0),
     154: ("Ukulele", 1.0),
-    # Keyboard instruments — weight 1.0
     141: ("Piano", 1.0),
     142: ("Electric piano", 1.0),
     143: ("Keyboard (musical)", 1.0),
     144: ("Organ", 1.0),
     145: ("Synthesizer", 1.2),
-    # Vocal (musical — not speech) — weight 1.0
     24: ("Singing", 1.0),
-    # Engine & machinery — weight 1.5
     337: ("Engine", 1.5),
     338: ("Motor vehicle (road)", 1.5),
     340: ("Car", 1.5),
     346: ("Motorcycle", 1.5),
     348: ("Truck", 1.5),
-    # Music categories — weight 1.0–1.5
     489: ("Heavy metal", 1.5),
     490: ("Punk rock", 1.5),
     486: ("Rock music", 1.0),
@@ -96,10 +66,8 @@ HAPTIC_WORTHY_CLASSES: dict[int, tuple[str, float]] = {
     492: ("Electronic music", 1.2),
     493: ("Techno", 1.2),
     132: ("Music", 1.0),
-    # Other impacts — weight 1.5
     455: ("Knock", 1.5),
     456: ("Tap", 1.5),
-    # Clock & tick-tock — weight 2.0 (crisp rhythmic taps)
     400: ("Clock", 2.0),
     401: ("Tick", 2.0),
     402: ("Tick-tock", 2.0),
@@ -122,16 +90,12 @@ NON_WORTHY_CLASSES: dict[int, str] = {
     **SPEECH_CLASSES,
     494: "Silence",
     495: "White noise",
-    # Gentle nature sounds
     278: "Rain",
     279: "Raindrop",
     283: "Wind",
-    # Crowd / murmur
     16: "Crowd",
     17: "Hubbub, speech noise",
 }
-
-# ── Lazy-loaded model singletons ─────────────────────────
 
 _yamnet_model: Any | None = None
 _yamnet_classes: list[str] | None = None
@@ -139,7 +103,7 @@ _whisper_model: Any | None = None
 
 
 def _load_yamnet():
-    """Load YAMNet model from TensorFlow Hub (lazy, ~18 MB)."""
+    """Load YAMNet from TensorFlow Hub (lazy, ~18 MB)."""
     global _yamnet_model, _yamnet_classes
 
     if _yamnet_model is not None:
@@ -152,11 +116,10 @@ def _load_yamnet():
         logger.info("Loading YAMNet model from TF Hub…")
         _yamnet_model = hub.load(settings.YAMNET_MODEL_HANDLE)
 
-        # Load class names from the model's bundled CSV
         class_map_path = _yamnet_model.class_map_path().numpy()
         class_map_csv = tf.io.read_file(class_map_path).numpy().decode("utf-8")
         reader = csv.reader(io.StringIO(class_map_csv))
-        next(reader)  # skip header
+        next(reader)
         _yamnet_classes = [row[2] for row in reader]
 
         logger.info("YAMNet loaded: %d classes", len(_yamnet_classes))
@@ -191,31 +154,13 @@ def _load_whisper():
         return None
 
 
-# ── Public API ───────────────────────────────────────────
-
-
 def classify_audio(wav_path: str) -> AIClassification:
-    """
-    Run YAMNet sound event detection + Whisper speech detection.
-
-    Parameters
-    ----------
-    wav_path : str
-        Path to mono WAV at 16 kHz.
-
-    Returns
-    -------
-    AIClassification
-        Per-frame haptic scores, speech scores, dominant labels,
-        and Whisper speech segment timestamps.
-    """
-    # Load audio at 16 kHz for both YAMNet and Whisper
+    """Run YAMNet sound event detection + Whisper speech detection on a 16 kHz WAV."""
     sr = settings.CLASSIFIER_SAMPLE_RATE
     y, sr = librosa.load(wav_path, sr=sr, mono=True)
     duration = float(len(y) / sr)
     logger.info("AI classification: %.2fs audio loaded at %d Hz", duration, sr)
 
-    # ── YAMNet classification ────────────────────────────
     yamnet = _load_yamnet()
     if yamnet is not None:
         haptic_scores, speech_scores, drum_scores, dominant_classes = _run_yamnet(
@@ -229,10 +174,8 @@ def classify_audio(wav_path: str) -> AIClassification:
         drum_scores = [0.0] * n_frames
         dominant_classes = ["unknown"] * n_frames
 
-    # ── Whisper speech detection ─────────────────────────
     speech_segments = _run_whisper(wav_path, duration)
 
-    # YAMNet frame hop is 0.48 s
     frame_dur = 0.48
 
     logger.info(
@@ -255,31 +198,22 @@ def classify_audio(wav_path: str) -> AIClassification:
     )
 
 
-# ── YAMNet inference ─────────────────────────────────────
-
-
 def _run_yamnet(
     model: Any,
     waveform: np.ndarray,
     sr: int,
     duration: float,
 ) -> tuple[list[float], list[float], list[float], list[str]]:
-    """Run YAMNet on the full waveform.
-
-    YAMNet internally windows at 0.96 s with 0.48 s hop,
-    producing ~2 frames/second.
-    """
+    """Run YAMNet on the full waveform (0.96 s window, 0.48 s hop)."""
     import tensorflow as tf
 
-    # YAMNet expects float32 in [-1, 1]
     waveform_f32 = waveform.astype(np.float32)
-    # Ensure values are in [-1, 1]
     peak = np.max(np.abs(waveform_f32))
     if peak > 1.0:
         waveform_f32 = waveform_f32 / peak
 
     scores, embeddings, log_mel = model(waveform_f32)
-    scores_np = scores.numpy()  # shape (N, 521)
+    scores_np = scores.numpy()
 
     haptic_scores: list[float] = []
     speech_scores: list[float] = []
@@ -297,21 +231,12 @@ def _run_yamnet(
         drum_scores.append(round(float(d), 4))
         dominant_classes.append(top)
 
-    # ── Temporal smoothing ───────────────────────────────
-    # EMA on numeric scores (α=0.3): preserves transient spikes
-    # while removing single-frame noise jitter.
     haptic_scores = _ema_smooth(haptic_scores, alpha=0.3)
     speech_scores = _ema_smooth(speech_scores, alpha=0.3)
     drum_scores = _ema_smooth(drum_scores, alpha=0.3)
-
-    # Majority-vote median filter on dominant class labels (window=3):
-    # kills single-frame class flips like explosion→music→explosion.
     dominant_classes = _median_filter_labels(dominant_classes, window=3)
 
     return haptic_scores, speech_scores, drum_scores, dominant_classes
-
-
-# ── Whisper speech detection ─────────────────────────────
 
 
 def _run_whisper(wav_path: str, duration: float) -> list[SpeechSegment]:
@@ -323,8 +248,8 @@ def _run_whisper(wav_path: str, duration: float) -> list[SpeechSegment]:
     try:
         segments, info = whisper.transcribe(
             wav_path,
-            beam_size=1,           # fastest decoding
-            vad_filter=True,       # use Silero VAD for filtering
+            beam_size=1,
+            vad_filter=True,
             vad_parameters=dict(
                 min_silence_duration_ms=300,
                 speech_pad_ms=100,
@@ -333,10 +258,9 @@ def _run_whisper(wav_path: str, duration: float) -> list[SpeechSegment]:
 
         speech_segments: list[SpeechSegment] = []
         for seg in segments:
-            # no_speech_prob: probability that this segment has no speech
             confidence = 1.0 - getattr(seg, "no_speech_prob", 0.0)
             if confidence < settings.WHISPER_MIN_CONFIDENCE:
-                continue  # skip very low confidence segments
+                continue
 
             speech_segments.append(SpeechSegment(
                 start=round(seg.start, 3),
@@ -356,20 +280,11 @@ def _run_whisper(wav_path: str, duration: float) -> list[SpeechSegment]:
         return []
 
 
-# ── Score computation helpers ────────────────────────────
-
-
 def _compute_haptic_score(probs: np.ndarray) -> float:
-    """Aggregate weighted probability of haptic-worthy classes.
-
-    Per-class weights emphasise impacts (3×) over ambient music (1×)
-    so explosions/crashes produce much higher scores than gentle
-    instruments sharing the same softmax budget.
-    """
+    """Weighted sum of haptic-worthy class probabilities (top-5 classes)."""
     worthy_indices = [i for i in HAPTIC_WORTHY_CLASSES.keys() if i < len(probs)]
     if not worthy_indices:
         return 0.0
-    # Multiply each class probability by its relevance weight
     weighted_probs = np.array([
         probs[i] * HAPTIC_WORTHY_CLASSES[i][1] for i in worthy_indices
     ])
@@ -381,7 +296,6 @@ _DRUM_INDICES: set[int] = {159, 160, 161, 162, 163, 164, 165, 166}
 
 
 def _compute_drum_score(probs: np.ndarray) -> float:
-    """Aggregate probability of drum/percussion classes."""
     drum_indices = [i for i in _DRUM_INDICES if i < len(probs)]
     if not drum_indices:
         return 0.0
@@ -389,7 +303,6 @@ def _compute_drum_score(probs: np.ndarray) -> float:
 
 
 def _compute_speech_score(probs: np.ndarray) -> float:
-    """Aggregate probability of speech/dialogue classes."""
     speech_indices = [i for i in SPEECH_CLASSES.keys() if i < len(probs)]
     if not speech_indices:
         return 0.0
@@ -397,7 +310,6 @@ def _compute_speech_score(probs: np.ndarray) -> float:
 
 
 def _get_dominant_class(probs: np.ndarray) -> str:
-    """Return the name of the highest-probability class."""
     global _yamnet_classes
     top_idx = int(np.argmax(probs))
 
@@ -410,15 +322,8 @@ def _get_dominant_class(probs: np.ndarray) -> str:
     return f"class_{top_idx}"
 
 
-# ── Temporal smoothing helpers ───────────────────────────
-
-
 def _ema_smooth(values: list[float], alpha: float = 0.3) -> list[float]:
-    """Exponential moving average smoothing.
-
-    alpha controls responsiveness: 0.3 = moderate smoothing,
-    preserves transient spikes while removing single-frame noise.
-    """
+    """Exponential moving average smoothing (alpha=0.3 preserves transient spikes)."""
     if len(values) <= 1:
         return values
 
@@ -429,13 +334,7 @@ def _ema_smooth(values: list[float], alpha: float = 0.3) -> list[float]:
 
 
 def _median_filter_labels(labels: list[str], window: int = 3) -> list[str]:
-    """Apply a majority-vote filter to a sequence of string labels.
-
-    For each position, look at a window of labels centered on that
-    position and pick the most common label.  Eliminates single-frame
-    class flips (e.g. explosion→music→explosion becomes
-    explosion→explosion→explosion).
-    """
+    """Majority-vote filter to eliminate single-frame class flips."""
     if len(labels) <= window:
         return labels
 
@@ -447,12 +346,10 @@ def _median_filter_labels(labels: list[str], window: int = 3) -> list[str]:
         hi = min(len(labels), i + half + 1)
         neighborhood = labels[lo:hi]
 
-        # Count occurrences and pick most common
         counts: dict[str, int] = {}
         for lbl in neighborhood:
             counts[lbl] = counts.get(lbl, 0) + 1
 
-        # Most common label (tie-break: keep original)
         max_count = max(counts.values())
         if counts.get(labels[i], 0) == max_count:
             result.append(labels[i])

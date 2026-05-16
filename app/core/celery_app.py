@@ -1,8 +1,3 @@
-"""Celery application and async task definitions.
-
-Pipeline: extract_audio → [analyze_dsp + analyze_video + classify_ai] → fuse_scores → generate_ahap
-"""
-
 from __future__ import annotations
 
 import json
@@ -20,8 +15,6 @@ from app.core.config import get_settings
 logger = logging.getLogger(__name__)
 settings = get_settings()
 
-# ── Celery app ───────────────────────────────────────────
-
 celery_app = Celery(
     "haptic_worker",
     broker=settings.CELERY_BROKER_URL,
@@ -35,22 +28,10 @@ celery_app.conf.update(
     timezone="UTC",
     enable_utc=True,
     task_track_started=True,
-    task_acks_late=True,                 # re-deliver on worker crash
-    worker_prefetch_multiplier=1,        # one task at a time (heavy)
-    result_expires=86400,                # results expire after 24h
+    task_acks_late=True,
+    worker_prefetch_multiplier=1,
+    result_expires=86400,
 )
-
-
-# ── Model pre-warming ────────────────────────────────────
-#
-# Celery's prefork pool forks a fresh child per concurrency slot.  Module
-# singletons in ai_classifier / video_analyzer are per-process, so each
-# child must load YAMNet, Whisper and MoViNet on its first task — adding
-# 5-15 s latency to the first job after a worker (re)start.
-#
-# `worker_process_init` fires once per child immediately after fork.
-# Loading the models here keeps them resident for the lifetime of the
-# child, so every task reuses the already-loaded weights.
 
 
 @worker_process_init.connect
@@ -67,14 +48,10 @@ def _prewarm_models(**_kwargs) -> None:
         _load_kinetics_labels()
         logger.info("Model pre-warm complete")
     except Exception as e:
-        # Non-fatal: models will lazy-load on first use if pre-warm fails.
         logger.warning("Model pre-warm failed (will lazy-load): %s", e)
 
 
-# ── Job status helpers (stored in Redis) ─────────────────
-
 def _redis():
-    """Return a Redis client from the Celery broker connection."""
     import redis
     return redis.Redis.from_url(settings.REDIS_URL, decode_responses=True)
 
@@ -85,7 +62,6 @@ def _set_job_status(
     progress: float = 0.0,
     **extra,
 ) -> None:
-    """Persist job status to Redis."""
     r = _redis()
     key = f"haptic:job:{job_id}"
     data = {
@@ -95,18 +71,14 @@ def _set_job_status(
         **{k: str(v) if not isinstance(v, (str, int, float)) else v for k, v in extra.items()},
     }
     r.hset(key, mapping=data)
-    r.expire(key, 86400)  # 24h TTL
+    r.expire(key, 86400)
 
 
 def get_job_status(job_id: str) -> dict | None:
-    """Read job status from Redis."""
     r = _redis()
     key = f"haptic:job:{job_id}"
     data = r.hgetall(key)
     return data if data else None
-
-
-# ── Analysis data persistence for visualization ─────────
 
 
 def _save_analysis_data(
@@ -116,7 +88,6 @@ def _save_analysis_data(
     video,
     timeline,
 ) -> None:
-    """Persist intermediate analysis data for the /visualize endpoint."""
     results_dir = Path(settings.RESULTS_DIR) / job_id
     results_dir.mkdir(parents=True, exist_ok=True)
     analysis_path = results_dir / f"{job_id}_analysis.json"
@@ -184,8 +155,6 @@ def _save_analysis_data(
     logger.info("[%s] Analysis data saved: %s", job_id, analysis_path)
 
 
-# ── Main pipeline task ───────────────────────────────────
-
 @celery_app.task(bind=True, name="haptic.analyze_video", max_retries=1)
 def analyze_video_task(
     self,
@@ -195,32 +164,10 @@ def analyze_video_task(
     style: str = "auto",
     bass_boost: float = 1.0,
 ) -> dict:
-    """
-    Full haptic analysis pipeline.
-
-    This is the main Celery task that runs the entire pipeline:
-    1. Extract audio from video (FFmpeg)
-    2. DSP + Video + AI analysis (parallel)
-    3. Haptic score fusion (DSP + AI + Video)
-    4. AHAP file generation
-
-    Parameters
-    ----------
-    job_id : str
-        Unique job identifier.
-    video_path : str
-        Path to the uploaded video file.
-    sensitivity : float
-        0-1 haptic sensitivity.
-    style : str
-        "auto", "cinematic", or "music".
-    bass_boost : float
-        0.5-2.0 bass energy multiplier.
-    """
+    """Full haptic analysis pipeline: audio extract → DSP/AI/video → fuse → AHAP."""
     start_time = time.time()
 
     try:
-        # ── Step 1: Extract audio ────────────────────────
         _set_job_status(job_id, "extracting_audio", progress=5.0)
         logger.info("[%s] Step 1/6: Extracting audio…", job_id)
 
@@ -233,7 +180,6 @@ def analyze_video_task(
             duration=duration,
         )
 
-        # ── Step 2+3: DSP + Video + AI (parallel) ────────
         _set_job_status(job_id, "analyzing", progress=25.0)
         logger.info("[%s] Step 2/5: DSP + Video + AI (parallel)…", job_id)
 
@@ -280,7 +226,6 @@ def analyze_video_task(
         if dsp_features is None or ai_result is None:
             raise RuntimeError("Required analysis stage failed (DSP or AI)")
 
-        # ── Step 3: Score Fusion ─────────────────────────
         _set_job_status(job_id, "scoring", progress=75.0)
         logger.info("[%s] Step 3/5: Score fusion…", job_id)
 
@@ -296,7 +241,6 @@ def analyze_video_task(
 
         _set_job_status(job_id, "scoring", progress=85.0)
 
-        # ── Persist analysis data for visualization ──────
         try:
             _save_analysis_data(
                 job_id, dsp_features, ai_result, video_features, timeline,
@@ -304,7 +248,6 @@ def analyze_video_task(
         except Exception as save_err:
             logger.warning("[%s] Analysis data save failed (non-fatal): %s", job_id, save_err)
 
-        # ── Step 4: AHAP Generation ─────────────────────
         _set_job_status(job_id, "generating_ahap", progress=90.0)
         logger.info("[%s] Step 4/5: Generating AHAP…", job_id)
 
@@ -312,7 +255,6 @@ def analyze_video_task(
         ahap = generate_ahap(timeline, job_id)
         ahap_path = save_ahap(ahap, job_id)
 
-        # ── Done ─────────────────────────────────────────
         elapsed = round(time.time() - start_time, 2)
         file_size = os.path.getsize(ahap_path)
 
@@ -334,7 +276,6 @@ def analyze_video_task(
             job_id, elapsed, ahap.total_events, len(ahap.chunks), file_size,
         )
 
-        # Cleanup temp audio files
         from app.services.audio_extractor import cleanup_job_files
         cleanup_job_files(job_id)
 
@@ -361,5 +302,4 @@ def analyze_video_task(
             processing_time=elapsed,
         )
 
-        # Retry once on transient errors
         raise self.retry(exc=exc, countdown=10, max_retries=1)
