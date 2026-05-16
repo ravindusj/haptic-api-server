@@ -301,18 +301,30 @@ def _detect_style(ai: AIClassification) -> str:
     if not ai.dominant_classes:
         return "auto"
 
+    # All names are verified YAMNet display strings (B1 sync).
     _MUSIC_LABELS = {
-        "Music", "Rock music", "Pop music", "Hip hop music",
-        "Heavy metal", "Punk rock", "Disco", "Electronic music",
-        "Techno", "Drum", "Snare drum", "Bass drum", "Drum kit",
-        "Guitar", "Electric guitar", "Acoustic guitar", "Piano",
-        "Bass guitar", "Singing", "Cymbal", "Hi-hat", "Drum roll",
-        "Synthesizer", "Organ", "Keyboard (musical)",
+        "Music", "Musical instrument",
+        "Rock music", "Pop music", "Hip hop music", "Heavy metal",
+        "Punk rock", "Rock and roll", "Funk", "Jazz", "Disco",
+        "Electronic music", "House music", "Techno", "Dubstep",
+        "Drum and bass", "Electronic dance music", "Dance music",
+        "Beatboxing", "Rapping",
+        "Drum", "Snare drum", "Bass drum", "Drum kit", "Drum machine",
+        "Percussion", "Cymbal", "Hi-hat", "Drum roll", "Rimshot",
+        "Guitar", "Electric guitar", "Acoustic guitar", "Bass guitar",
+        "Plucked string instrument", "Strum",
+        "Piano", "Electric piano", "Synthesizer", "Organ",
+        "Keyboard (musical)",
+        "Violin, fiddle", "Cello", "Double bass",
+        "Trumpet", "Trombone", "Saxophone", "Flute", "Clarinet",
+        "Singing", "Choir", "Chant",
     }
+    # YAMNet has no gender-tagged speech classes — those names were
+    # dead lookups in the original code.  Real speech-bearing labels:
     _SPEECH_LABELS = {
-        "Speech", "Male speech, man speaking",
-        "Female speech, woman speaking", "Child speech, kid speaking",
-        "Conversation", "Narration, monologue",
+        "Speech", "Conversation", "Narration, monologue",
+        "Child speech, kid speaking", "Babbling", "Whispering",
+        "Speech synthesizer",
     }
 
     music_count = sum(1 for c in ai.dominant_classes if c in _MUSIC_LABELS)
