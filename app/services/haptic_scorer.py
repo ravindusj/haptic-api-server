@@ -1046,10 +1046,23 @@ def _apply_scenario_modulation(
     last_crash_burst_t = -10.0
     last_sports_tap_t = -10.0
 
+    # New categories (C1) — phase accumulators + tap cooldowns
+    dance_phase = 0.0
+    music_phase = 0.0
+    water_phase = 0.0
+    construction_phase = 0.0
+    last_music_tap_t = -10.0
+    last_construction_tap_t = -10.0
+    last_cooking_tap_t = -10.0
+    prev_motion = 0.0
+
     IMPACT_TAP_CD = 0.30
     CHASE_TAP_CD = 0.12
     CRASH_BURST_CD = 0.60
     SPORTS_TAP_CD = 0.40
+    MUSIC_TAP_CD = 0.20
+    CONSTRUCTION_TAP_CD = 0.35
+    COOKING_TAP_CD = 0.25
 
     for fi in range(n_frames):
         if fi >= len(video_actions):
@@ -1064,6 +1077,14 @@ def _apply_scenario_modulation(
                 fall_landed = False
             if action == "chase":
                 chase_phase = 0.0
+            if action == "dance":
+                dance_phase = 0.0
+            if action == "music_performance":
+                music_phase = 0.0
+            if action == "water_action":
+                water_phase = 0.0
+            if action == "construction":
+                construction_phase = 0.0
 
         if action == "impact":
             score = video_action_scores.get("impact", np.zeros(1))
@@ -1201,6 +1222,94 @@ def _apply_scenario_modulation(
                 ))
                 last_sports_tap_t = t
 
+        # ── DANCE ────────────────────────────────────────
+        # Smooth rhythmic envelope (1.5-3.5 Hz) without footstep taps —
+        # taps on a dancer would feel like striking footfalls (wrong).
+        elif action == "dance":
+            freq = 1.5 + 2.0 * motion
+            dance_phase += 2.0 * np.pi * freq * frame_dur
+            pulse = 0.5 + 0.5 * np.sin(dance_phase)
+            result[fi] *= 0.70 + 0.30 * pulse * max(0.25, motion)
+            sharpness_mod[fi] = -0.10  # soft, body-weighted
+
+        # ── MUSIC_PERFORMANCE ────────────────────────────
+        # Gentle 2-3 Hz rhythmic pulse with accent tap on pulse peaks —
+        # designed for instrument performance / singing scenes.
+        elif action == "music_performance":
+            score = video_action_scores.get("music_performance", np.zeros(1))
+            s = float(score[min(fi, len(score) - 1)]) if len(score) > 0 else 0.0
+            freq = 2.0 + 1.0 * max(s, motion)
+            music_phase += 2.0 * np.pi * freq * frame_dur
+            pulse = 0.5 + 0.5 * np.sin(music_phase)
+            result[fi] *= 0.65 + 0.30 * pulse
+            sharpness_mod[fi] = 0.20  # mid sharpness for note onsets
+
+            if (pulse > 0.93
+                    and s > 0.10
+                    and (t - last_music_tap_t) > MUSIC_TAP_CD):
+                tap_int = min(0.85, 0.30 + 0.45 * s)
+                transients.append(HapticEvent(
+                    time=round(t, 4),
+                    event_type="transient",
+                    intensity=round(tap_int, 4),
+                    sharpness=0.60,
+                ))
+                last_music_tap_t = t
+
+        # ── WATER_ACTION ─────────────────────────────────
+        # Sustained smooth wave-like oscillation (0.5-1.5 Hz) with very
+        # low sharpness — flowing, no transients.
+        elif action == "water_action":
+            freq = 0.5 + 1.0 * motion
+            water_phase += 2.0 * np.pi * freq * frame_dur
+            wave = 0.5 + 0.5 * np.sin(water_phase)
+            result[fi] = max(result[fi], 0.20 + 0.25 * wave + 0.20 * motion)
+            sharpness_mod[fi] = -0.35  # deep, fluid
+
+        # ── CONSTRUCTION ─────────────────────────────────
+        # Rhythmic hammer/saw cadence (1-2 Hz) with accent tap on each
+        # downbeat — repetitive mechanical work.
+        elif action == "construction":
+            score = video_action_scores.get("construction", np.zeros(1))
+            s = float(score[min(fi, len(score) - 1)]) if len(score) > 0 else 0.0
+            freq = 1.0 + 1.5 * max(s, motion)
+            construction_phase += 2.0 * np.pi * freq * frame_dur
+            pulse = 0.5 + 0.5 * np.sin(construction_phase)
+            result[fi] *= 0.60 + 0.40 * pulse * max(0.30, motion)
+            sharpness_mod[fi] = 0.30  # mid-sharp mechanical
+
+            if (pulse > 0.94
+                    and motion > 0.12
+                    and (t - last_construction_tap_t) > CONSTRUCTION_TAP_CD):
+                tap_int = min(0.95, 0.45 + 0.45 * max(s, motion))
+                transients.append(HapticEvent(
+                    time=round(t, 4),
+                    event_type="transient",
+                    intensity=round(tap_int, 4),
+                    sharpness=0.70,
+                ))
+                last_construction_tap_t = t
+
+        # ── COOKING ──────────────────────────────────────
+        # Light accent taps on motion spikes (chopping / cutting),
+        # otherwise minimal continuous feel.
+        elif action == "cooking":
+            result[fi] *= 0.85 + 0.20 * motion
+            sharpness_mod[fi] = 0.10
+
+            motion_deriv = motion - prev_motion
+            if (motion_deriv > 0.15
+                    and (t - last_cooking_tap_t) > COOKING_TAP_CD):
+                tap_int = min(0.70, 0.35 + 0.50 * motion)
+                transients.append(HapticEvent(
+                    time=round(t, 4),
+                    event_type="transient",
+                    intensity=round(tap_int, 4),
+                    sharpness=0.55,
+                ))
+                last_cooking_tap_t = t
+
+        prev_motion = motion
         prev_action = action
 
     smooth_win = max(1, int(0.05 / frame_dur))

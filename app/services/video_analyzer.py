@@ -27,40 +27,202 @@ MOVINET_HUB_URL: str = (
 
 _kinetics_labels: list[str] | None = None
 
+# ── Kinetics-600 → haptic category mapping (C1) ─────────
+# Comprehensive coverage: ~340 of 600 classes mapped to 11 haptic scenarios.
+# Classes that are inherently haptic-neutral (eating, sleeping, talking,
+# fine-motor crafts) remain unmapped and resolve to "none" at runtime.
+# When a class fits multiple categories (e.g. "smashing" is both impact
+# and crash), the *first* assigned category wins via setdefault() below.
+
 IMPACT_INDICES: set[int] = {
-    4, 11, 58, 177, 209, 211, 319, 390, 391, 458, 472, 475, 511, 513, 594,
+    # Wrestling / fighting / strikes
+    4, 11, 30, 49, 58, 66, 152, 177, 209, 211,
+    245, 246, 319, 388, 390, 391, 458, 472, 475,
+    495, 511, 513, 527, 530, 594,
+    # 4 alligator wrestling, 11 arm wrestling, 30 bending metal,
+    # 49 breaking boards, 58 bull fighting, 66 capoeira,
+    # 152 drop kicking, 177 fencing, 209 headbutting, 211 high kick,
+    # 245 kicking field goal, 246 kicking soccer ball, 319 pillow fight,
+    # 388 pumping fist, 390 punching bag, 391 punching person (boxing),
+    # 458 side kick, 472 slapping, 475 smashing, 495 steer roping,
+    # 511 sword fighting, 513 tackling, 527 throwing axe,
+    # 530 throwing knife, 594 wrestling
 }
 
-CHASE_INDICES: set[int] = {236, 307, 427}
+CHASE_INDICES: set[int] = {
+    223, 236, 281, 307, 427, 457, 537,
+    # 223 hurdling, 236 jogging, 281 marching, 307 parkour,
+    # 427 running on treadmill, 457 shuffling feet, 537 tiptoeing
+}
 
-CRASH_INDICES: set[int] = {59, 67, 475}
+CRASH_INDICES: set[int] = {
+    59, 67, 393, 475, 552,
+    # 59 bulldozing, 67 capsizing, 393 pushing car, 475 smashing,
+    # 552 unloading truck
+}
 
 FALL_INDICES: set[int] = {
-    17, 22, 60, 71, 139, 171, 172, 173, 204, 210, 240,
-    241, 263, 381, 464, 470, 486, 490, 545,
+    17, 22, 29, 31, 39, 44, 60, 71, 139, 171, 172, 173,
+    204, 207, 210, 217, 218, 225, 240, 241, 242, 263,
+    266, 293, 305, 306, 381, 422, 424, 463, 464, 465, 466,
+    467, 468, 470, 483, 485, 486, 487, 490, 493, 510,
+    536, 538, 541, 545,
+    # 17 backflip, 22 base jumping, 29 bending back, 31 biking through snow,
+    # 39 bobsledding, 44 bouncing on trampoline, 60 bungee jumping,
+    # 71 cartwheeling, 139 diving cliff, 171 faceplanting, 172 falling off bike,
+    # 173 falling off chair, 204 gymnastics tumbling, 207 head stand,
+    # 210 high jump, 217 hopscotch, 218 hoverboarding, 225 ice climbing,
+    # 240 jumping bicycle, 241 jumping into pool, 242 jumping jacks,
+    # 263 long jump, 266 luge, 293 mountain climber, 305 paragliding,
+    # 306 parasailing, 381 pole vault, 422 rock climbing, 424 roller skating,
+    # 463 skateboarding, 464 ski jumping, 465-467 skiing variants,
+    # 468 skipping rope, 470 skydiving, 483 snowboarding, 485 snowmobiling,
+    # 486 somersaulting, 487 spelunking, 490 springboard diving,
+    # 493 standing on hands, 510 swinging on something, 536 tightrope walking,
+    # 538 tobogganing, 541 trapezing, 545 triple jump
 }
 
-DRIVING_INDICES: set[int] = {149, 150, 235, 253, 292, 409, 415}
+DRIVING_INDICES: set[int] = {
+    80, 149, 150, 235, 251, 253, 292, 389, 408,
+    409, 412, 415, 416, 417, 564,
+    # 80 changing gear in car, 149 driving car, 150 driving tractor,
+    # 235 jetskiing, 251 land sailing, 253 lawn mower racing,
+    # 292 motorcycling, 389 pumping gas, 408 repairing puncture,
+    # 409 riding a bike, 412 riding mechanical bull, 415 riding scooter,
+    # 416 riding snow blower, 417 riding unicycle, 564 using segway
+}
 
 SPORTS_HIT_INDICES: set[int] = {
-    76, 197, 198, 199, 205, 213, 224, 336, 342, 349, 372, 450, 453, 509,
+    9, 45, 76, 77, 78, 94, 133, 138, 141, 147, 155,
+    189, 197, 198, 199, 205, 213, 214, 224, 233, 239,
+    308, 309, 310, 326, 328, 336, 338, 342, 349, 351,
+    357, 360, 364, 366, 371, 372, 377, 426, 450, 451,
+    453, 480, 492, 509, 528, 529, 531, 533,
+    # 9 archery, 45 bowling, 76-78 catching/throwing ball variants,
+    # 94 clean and jerk, 133 deadlifting, 138 disc golfing, 141 dodgeball,
+    # 147 dribbling basketball, 155 dunking basketball, 189 front raises,
+    # 197-199 golf, 205 hammer throw, 213 hitting baseball, 214 hockey stop,
+    # 224 hurling, 233 javelin throw, 239 juggling soccer ball,
+    # 308-310 passing variants, 326 playing badminton, 328 playing basketball,
+    # 336 playing cricket, 338 playing darts, 342 playing field hockey,
+    # 349 playing ice hockey, 351 playing kickball, 357 playing netball,
+    # 360 playing paintball, 364 playing ping pong, 366 playing polo,
+    # 371 playing squash, 372 playing tennis, 377 playing volleyball,
+    # 426 rope pushdown, 450 shooting basketball, 451 shooting goal,
+    # 453 shot put, 480 snatch weight lifting, 492 squat,
+    # 509 swinging baseball bat, 528-529 throwing variants,
+    # 531 throwing snowballs, 533 throwing water balloon
 }
 
+# ── NEW: Dance / rhythmic body movement ──
+DANCE_INDICES: set[int] = {
+    27, 48, 84, 113, 121, 129, 130, 131, 132, 142,
+    208, 222, 243, 250, 289, 291, 321, 421, 429, 488,
+    491, 501, 508, 515, 517, 518, 599,
+    # 27 belly dancing, 48 breakdancing, 84 cheerleading,
+    # 113 country line dancing, 121 cumbia, 129-132 dancing variants,
+    # 142 doing aerobics, 208 headbanging, 222 hula hooping,
+    # 243 jumpstyle dancing, 250 krumping, 289 moon walking,
+    # 291 mosh pit dancing, 321 pirouetting, 421 robot dancing,
+    # 429 salsa dancing, 488 spinning poi, 491 square dancing,
+    # 501 surfing crowd, 508 swing dancing, 515 tai chi,
+    # 517 tango dancing, 518 tap dancing, 599 zumba
+}
+
+# ── NEW: Music performance / instruments / singing ──
+MUSIC_PERFORMANCE_INDICES: set[int] = {
+    3, 25, 62, 153, 179, 200, 244, 325, 327, 329,
+    332, 334, 337, 339, 341, 343, 344, 345, 346, 347,
+    348, 350, 353, 354, 358, 359, 361, 362, 367, 369,
+    373, 374, 375, 376, 379, 407, 460, 519, 520,
+    # 3 air drumming, 25 beatboxing, 62 busking, 153 drumming fingers,
+    # 179 finger snapping, 200 gospel singing, 244 karaoke,
+    # 325 accordion, 327 bagpipes, 329 bass guitar, 332 cello,
+    # 334 clarinet, 337 cymbals, 339 didgeridoo, 341 drums,
+    # 343 flute, 344 gong, 345 guitar, 346 hand clapping games,
+    # 347 harmonica, 348 harp, 350 keyboard, 353 lute, 354 maracas,
+    # 358 ocarina, 359 organ, 361 pan pipes, 362 piano,
+    # 367 recorder, 369 saxophone, 373 trombone, 374 trumpet,
+    # 375 ukulele, 376 violin, 379 xylophone, 407 recording music,
+    # 460 singing, 519 tapping guitar, 520 tapping pen
+}
+
+# ── NEW: Water action ──
+WATER_ACTION_INDICES: set[int] = {
+    40, 65, 91, 119, 140, 228, 248, 428, 436, 469,
+    482, 484, 502, 504, 505, 506, 507, 567, 568, 578,
+    579, 590,
+    # 40 bodysurfing, 65 canoeing/kayaking, 91 clam digging,
+    # 119 crossing river, 140 docking boat, 228 ice swimming,
+    # 248 kitesurfing, 428 sailing, 436 scuba diving,
+    # 469 skipping stone, 482 snorkeling, 484 snowkiting,
+    # 502 surfing water, 504-507 swimming strokes,
+    # 567 wading through mud, 568 wading through water,
+    # 578 water skiing, 579 water sliding, 590 windsurfing
+}
+
+# ── NEW: Construction / tools / repetitive mechanical work ──
+CONSTRUCTION_INDICES: set[int] = {
+    13, 32, 35, 54, 55, 56, 57, 86, 87, 90,
+    180, 230, 254, 255, 256, 257, 273, 295, 322, 324,
+    430, 432, 444, 554, 555, 556, 557, 560, 588,
+    # 13 assembling bicycle, 32 blasting sand, 35 blowing glass,
+    # 54-57 building variants, 86-87 chiseling, 90 chopping wood,
+    # 180 fixing bicycle, 230 installing carpet, 254-257 laying variants,
+    # 273 making horseshoes, 295 mowing lawn, 322 planing wood,
+    # 324 plastering, 430 sanding floor, 432 sawing wood,
+    # 444 sharpening pencil, 554 using paint roller,
+    # 555 using power drill, 556 using sledge hammer,
+    # 557 using wrench, 560 using circular saw, 588 welding
+}
+
+# ── NEW: Cooking / food prep ──
+COOKING_INDICES: set[int] = {
+    18, 20, 47, 88, 89, 107, 108, 109, 110, 124,
+    126, 127, 128, 183, 190, 201, 268, 269, 272, 276,
+    278, 279, 311, 312, 385, 420, 425, 433, 437, 442,
+    443, 455, 497,
+    # 18 baking cookies, 20 barbequing, 47 breading,
+    # 88-89 chopping meat/vegetables, 107-110 cooking variants,
+    # 124-128 cutting fruit, 183 flipping pancake, 190 frying vegetables,
+    # 201 grinding meat, 268-279 making variants, 311-312 peeling,
+    # 385 preparing salad, 420 roasting pig, 425 rolling pastry,
+    # 433 scrambling eggs, 437 separating eggs, 442 shaping bread dough,
+    # 443 sharpening knives, 455 shucking oysters, 497 stomping grapes
+}
+
+# All category mappings as {index → category_name}.
+# setdefault() preserves first-assigned category so dual-mapped indices
+# (e.g. 475 smashing — IMPACT primary, CRASH secondary) stay stable.
 _CATEGORY_MAP: dict[int, str] = {}
 for _idx in IMPACT_INDICES:
-    _CATEGORY_MAP[_idx] = "impact"
+    _CATEGORY_MAP.setdefault(_idx, "impact")
 for _idx in CHASE_INDICES:
-    _CATEGORY_MAP[_idx] = "chase"
+    _CATEGORY_MAP.setdefault(_idx, "chase")
 for _idx in CRASH_INDICES:
     _CATEGORY_MAP.setdefault(_idx, "crash")
 for _idx in FALL_INDICES:
-    _CATEGORY_MAP[_idx] = "fall"
+    _CATEGORY_MAP.setdefault(_idx, "fall")
 for _idx in DRIVING_INDICES:
-    _CATEGORY_MAP[_idx] = "driving"
+    _CATEGORY_MAP.setdefault(_idx, "driving")
 for _idx in SPORTS_HIT_INDICES:
-    _CATEGORY_MAP[_idx] = "sports_hit"
+    _CATEGORY_MAP.setdefault(_idx, "sports_hit")
+for _idx in DANCE_INDICES:
+    _CATEGORY_MAP.setdefault(_idx, "dance")
+for _idx in MUSIC_PERFORMANCE_INDICES:
+    _CATEGORY_MAP.setdefault(_idx, "music_performance")
+for _idx in WATER_ACTION_INDICES:
+    _CATEGORY_MAP.setdefault(_idx, "water_action")
+for _idx in CONSTRUCTION_INDICES:
+    _CATEGORY_MAP.setdefault(_idx, "construction")
+for _idx in COOKING_INDICES:
+    _CATEGORY_MAP.setdefault(_idx, "cooking")
 
-ALL_ACTION_CATEGORIES = ["impact", "chase", "crash", "fall", "driving", "sports_hit"]
+ALL_ACTION_CATEGORIES = [
+    "impact", "chase", "crash", "fall", "driving", "sports_hit",
+    "dance", "music_performance", "water_action",
+    "construction", "cooking",
+]
 
 
 def analyze_video(video_path: str) -> VideoFeatures:
