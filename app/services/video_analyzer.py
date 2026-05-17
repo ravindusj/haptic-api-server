@@ -15,15 +15,51 @@ logger = logging.getLogger(__name__)
 settings = get_settings()
 
 _movinet_model: Any | None = None
+_active_movinet_variant: str | None = None
+_active_movinet_size: int | None = None
 
 VIDEO_ANALYSIS_FPS: float = 5.0
-
-MOVINET_SIZE: int = 172
 MOVINET_WINDOW: int = 16
-MOVINET_HUB_URL: str = (
-    "https://www.kaggle.com/models/google/movinet/"
-    "TensorFlow2/a0-base-kinetics-600-classification/3"
-)
+
+# ── C2: per-variant MoViNet config ──────────────────────
+# Each variant is published on Kaggle as a TF2 SavedModel.  Input
+# resolution is variant-specific; the spec sheet:
+#   A0: 172×172 (~3M params)
+#   A1: 172×172 (~4M params)
+#   A2: 224×224 (~5M params)  ← default (C2)
+#   A3: 256×256 (~7M params)
+_MOVINET_VARIANTS: dict[str, tuple[str, int]] = {
+    "a0": (
+        "https://www.kaggle.com/models/google/movinet/"
+        "TensorFlow2/a0-base-kinetics-600-classification/3",
+        172,
+    ),
+    "a1": (
+        "https://www.kaggle.com/models/google/movinet/"
+        "TensorFlow2/a1-base-kinetics-600-classification/3",
+        172,
+    ),
+    "a2": (
+        "https://www.kaggle.com/models/google/movinet/"
+        "TensorFlow2/a2-base-kinetics-600-classification/3",
+        224,
+    ),
+    "a3": (
+        "https://www.kaggle.com/models/google/movinet/"
+        "TensorFlow2/a3-base-kinetics-600-classification/3",
+        256,
+    ),
+}
+
+
+def _movinet_resolution() -> int:
+    """Return the input resolution of the currently-loaded MoViNet variant."""
+    if _active_movinet_size is not None:
+        return _active_movinet_size
+    return _MOVINET_VARIANTS.get(
+        settings.MOVINET_VARIANT, _MOVINET_VARIANTS["a0"],
+    )[1]
+
 
 _kinetics_labels: list[str] | None = None
 
@@ -231,8 +267,30 @@ def analyze_video(video_path: str) -> VideoFeatures:
     duration = _get_duration(video_path)
     logger.info("Video analysis: %.2fs video at %s", duration, video_path)
 
-    (motion_intensity, scene_changes, visual_flash, camera_shake,
+    # C2: pre-load MoViNet *before* the decode pass so the active
+    # variant's input resolution (172² or 224²) is locked in for the
+    # MoViNet frame buffer.  A failed A2 load that silently falls
+    # back to A0 would otherwise leave 224²-sized frames in a buffer
+    # the model can't consume.
+    _load_movinet()
+
+    # Decode pass returns scene_changes from a legacy frame-diff
+    # heuristic — we discard it and use PySceneDetect (C3) instead.
+    (motion_intensity, _heuristic_scenes, visual_flash, camera_shake,
      movinet_frames) = _decode_and_compute_motion(video_path)
+
+    # C3: AdaptiveDetector catches fades, dissolves, crossfades that
+    # the old frame-diff > 3× median heuristic misses.  Falls back to
+    # the heuristic if PySceneDetect import/run fails.
+    scene_changes = _detect_scenes_pyscenedetect(video_path)
+    if scene_changes is None:
+        scene_changes = _heuristic_scenes
+        logger.info("Using heuristic scene cuts (%d)", len(scene_changes))
+    else:
+        logger.info(
+            "PySceneDetect: %d scene cuts (heuristic would have found %d)",
+            len(scene_changes), len(_heuristic_scenes),
+        )
 
     logger.info(
         "Motion analysis: %d frames, %d scene changes, "
@@ -295,7 +353,9 @@ def _decode_and_compute_motion(
             break
 
         if frame_idx % frame_step == 0:
-            mv = cv2.resize(frame, (MOVINET_SIZE, MOVINET_SIZE))
+            # C2: resolution is variant-specific (A0=172, A2=224, …)
+            _mv_size = _movinet_resolution()
+            mv = cv2.resize(frame, (_mv_size, _mv_size))
             mv = cv2.cvtColor(mv, cv2.COLOR_BGR2RGB)
             movinet_frames.append(mv)
 
@@ -389,24 +449,114 @@ def _decode_and_compute_motion(
     return motion_intensity, scene_changes, visual_flash, camera_shake, movinet_frames
 
 
+def _detect_scenes_pyscenedetect(video_path: str) -> list[SceneChange] | None:
+    """Detect scene cuts using PySceneDetect's AdaptiveDetector (C3).
+
+    Returns ``None`` if PySceneDetect is unavailable or fails — caller
+    then falls back to the legacy frame-diff heuristic.
+
+    AdaptiveDetector compares each frame against a rolling baseline
+    of neighbours, which makes it robust to:
+      * gradual fades and dissolves (heuristic misses entirely)
+      * crossfades / soft cuts (heuristic underweights)
+      * varying overall scene brightness (heuristic gets false
+        positives from a single bright frame)
+
+    Magnitude is derived from the cut's StatsManager content_val
+    relative to the detector threshold, capped at 5× for parity with
+    the heuristic's normalised range (the scorer scales by 5.0).
+    """
+    try:
+        from scenedetect import (
+            SceneManager, StatsManager, AdaptiveDetector, open_video,
+        )
+    except Exception as e:
+        logger.warning("scenedetect import failed (%s) — heuristic fallback", e)
+        return None
+
+    try:
+        video = open_video(video_path)
+        stats = StatsManager()
+        sm = SceneManager(stats_manager=stats)
+        detector = AdaptiveDetector()
+        sm.add_detector(detector)
+        sm.detect_scenes(video=video, show_progress=False)
+        scene_list = sm.get_scene_list()
+    except Exception as e:
+        logger.warning("PySceneDetect run failed (%s) — heuristic fallback", e)
+        return None
+
+    cuts: list[SceneChange] = []
+    # First scene starts at t=0 which is not a cut — skip it.
+    # PySceneDetect's AdaptiveDetector / ContentDetector metric scales
+    # don't map 1:1 to the legacy heuristic's "frame-diff / 3× median"
+    # magnitude, so we use a flat magnitude=3.0 (≈ medium-strong cut)
+    # which the scorer maps to intensity≈0.80.  Better magnitude
+    # estimation would require per-detector calibration.
+    for i, (start, _end) in enumerate(scene_list):
+        if i == 0:
+            continue
+        cuts.append(SceneChange(
+            time=round(float(start.get_seconds()), 3),
+            magnitude=3.0,
+        ))
+    return cuts
+
+
 def _load_movinet():
-    """Load MoViNet-A0 from TF Hub (lazy, ~20 MB)."""
-    global _movinet_model
+    """Load the configured MoViNet variant lazily (C2).
+
+    Default is A2-base (224², ~5× more accurate than A0).  On any
+    failure (download, OOM, TF Hub outage) we fall back automatically
+    to A0-base so analysis still runs — just at the old accuracy.
+    """
+    global _movinet_model, _active_movinet_variant, _active_movinet_size
 
     if _movinet_model is not None:
         return _movinet_model
 
     try:
         import tensorflow_hub as hub
-        import tensorflow as tf
-
-        logger.info("Loading MoViNet-A0 from TF Hub…")
-        _movinet_model = hub.load(MOVINET_HUB_URL)
-        logger.info("MoViNet-A0 loaded successfully")
-        return _movinet_model
     except Exception as e:
-        logger.warning("MoViNet failed to load: %s", str(e))
+        logger.warning("tensorflow_hub import failed: %s", e)
         return None
+
+    requested = settings.MOVINET_VARIANT.lower()
+    if requested not in _MOVINET_VARIANTS:
+        logger.warning(
+            "Unknown MOVINET_VARIANT=%r — defaulting to a2", requested,
+        )
+        requested = "a2"
+
+    # Try requested variant first, then A0 as fallback.  De-dupe so we
+    # don't double-try A0 when A0 itself is requested.
+    candidates: list[str] = [requested]
+    if "a0" not in candidates:
+        candidates.append("a0")
+
+    for variant in candidates:
+        url, size = _MOVINET_VARIANTS[variant]
+        try:
+            logger.info(
+                "Loading MoViNet-%s (%d²) from TF Hub…",
+                variant.upper(), size,
+            )
+            _movinet_model = hub.load(url)
+            _active_movinet_variant = variant
+            _active_movinet_size = size
+            logger.info(
+                "MoViNet-%s loaded successfully (input=%d²)",
+                variant.upper(), size,
+            )
+            return _movinet_model
+        except Exception as e:
+            logger.warning(
+                "MoViNet-%s load failed: %s — trying next variant",
+                variant.upper(), str(e)[:200],
+            )
+
+    logger.warning("All MoViNet variants failed to load")
+    return None
 
 
 def _load_kinetics_labels() -> list[str]:

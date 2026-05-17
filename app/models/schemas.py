@@ -16,6 +16,9 @@ class AnalysisStyle(str, enum.Enum):
 class JobStatus(str, enum.Enum):
     QUEUED = "queued"
     EXTRACTING_AUDIO = "extracting_audio"
+    # Umbrella state while DSP + video + AI run in parallel; once one
+    # finishes the worker switches to the more specific stage value.
+    ANALYZING = "analyzing"
     ANALYZING_VIDEO = "analyzing_video"
     ANALYZING_DSP = "analyzing_dsp"
     CLASSIFYING_AI = "classifying_ai"

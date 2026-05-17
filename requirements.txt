@@ -23,6 +23,9 @@ tensorflow-hub>=0.16.1
 faster-whisper>=1.0.0
 # ── Video Analysis (motion + action recognition) ────────
 opencv-python-headless>=4.8.0
+# Robust scene-cut detection (C3) — catches fades / dissolves / crossfades
+# that the old frame-diff heuristic misses.
+scenedetect[opencv]>=0.6.4
 # ── Utilities ────────────────────────────────────────────
 python-dotenv==1.0.1
 

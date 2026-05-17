@@ -74,6 +74,13 @@ class Settings(BaseSettings):
     HAPTIC_CURVE_VARIANCE_THRESHOLD: float = 0.03
     HAPTIC_REST_INTENSITY_THRESHOLD: float = 0.02
 
+    # ── C2: MoViNet variant ──────────────────────────────
+    # "a0" (172², ~3M params, fast) or "a2" (224², ~5M params,
+    # ~5× more accurate per Google's reported numbers).  The
+    # video_analyzer loads the variant declared here and falls back
+    # to "a0" if the larger model fails to download or load.
+    MOVINET_VARIANT: str = "a2"
+
     # ── A1: LFE-channel haptic weight ────────────────────
     # When the source is 5.1+ and a dedicated LFE channel is
     # extracted, the LFE RMS envelope is folded directly into the
