@@ -193,7 +193,11 @@ def analyze_video_task(
         ai_result = None
 
         with ThreadPoolExecutor(max_workers=3) as pool:
-            dsp_future = pool.submit(analyze_dsp, audio_result["librosa_wav"])
+            dsp_future = pool.submit(
+                analyze_dsp,
+                audio_result["librosa_wav"],
+                audio_result.get("lfe_wav"),
+            )
             vid_future = pool.submit(analyze_video, video_path)
             ai_future = pool.submit(classify_audio, audio_result["classifier_wav"])
 

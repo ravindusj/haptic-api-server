@@ -74,6 +74,22 @@ class Settings(BaseSettings):
     HAPTIC_CURVE_VARIANCE_THRESHOLD: float = 0.03
     HAPTIC_REST_INTENSITY_THRESHOLD: float = 0.02
 
+    # ── A1: LFE-channel haptic weight ────────────────────
+    # When the source is 5.1+ and a dedicated LFE channel is
+    # extracted, the LFE RMS envelope is folded directly into the
+    # haptic intensity signal with this weight.  Cinema LFE peaks
+    # are intentionally near-clipping during explosions, so a weight
+    # around 0.30-0.45 keeps it dominant on impact frames while
+    # leaving headroom for the multi-band mix on quieter content.
+    LFE_WEIGHT: float = 0.35
+
+    # ── A4: Attack-time sharpness blending ───────────────
+    # Weight of the per-frame attack envelope (rising onset rate)
+    # applied additively to the heuristic sharpness signal.
+    # 0.0 disables A4; 0.30 means a max-attack frame can raise
+    # sharpness by up to 0.30 above its band-balance value.
+    ATTACK_SHARPNESS_WEIGHT: float = 0.30
+
     # ── Transient "thud" duration (E2) ───────────────────
     # HapticTransient events are zero-duration impulses on iOS, which can
     # feel clinical for low-sharpness ("thud") taps.  When a transient's

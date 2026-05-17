@@ -371,6 +371,31 @@ def fuse_scores(
     mid = np.array(dsp.mid_energy, dtype=np.float64)
     presence = np.array(dsp.presence_energy, dtype=np.float64)
 
+    # ── A1: fold LFE directly into sub_bass + bass when present ──
+    # The LFE channel is the producer's explicit "this should rumble"
+    # signal — apply bass_boost to it, then take the per-frame max
+    # with the bandpass-derived sub_bass/bass so cinema LFE peaks
+    # dominate but quiet sections fall back to spectral inference.
+    if dsp.has_lfe and dsp.lfe_energy:
+        _lfe = np.array(dsp.lfe_energy, dtype=np.float64)
+        if len(_lfe) != n_frames:
+            _lfe = _resample_to_length(_lfe, n_frames)
+        _lfe_boosted = np.clip(_lfe * bass_boost, 0.0, 1.0)
+        sub_bass = np.maximum(sub_bass, _lfe_boosted)
+        bass = np.maximum(bass, _lfe_boosted * 0.85)
+        logger.info(
+            "LFE folded into bass bands: mean=%.3f peak=%.3f",
+            float(np.mean(_lfe)), float(np.max(_lfe)),
+        )
+
+    # ── A4: attack-rate envelope (used in sharpness blending below) ──
+    if dsp.attack_envelope:
+        attack_env = np.array(dsp.attack_envelope, dtype=np.float64)
+        if len(attack_env) != n_frames:
+            attack_env = _resample_to_length(attack_env, n_frames)
+    else:
+        attack_env = np.zeros(n_frames, dtype=np.float64)
+
     # Per-band novelty gate: suppress flat ambient energy (HVAC, wind, traffic).
     _band_nov_win = max(3, int(1.0 / frame_dur))
     for _band in (sub_bass, bass, low_mid, mid, presence):
@@ -468,6 +493,18 @@ def fuse_scores(
         + weights.ai * ai_haptic
         + harmonic_contribution
     )
+
+    # ── A1: explicit LFE contribution (in addition to band-merging) ──
+    # Cinema mixes ride LFE near clipping during explosions; an
+    # additive injection makes those moments genuinely overwhelm the
+    # rest of the haptic signal. Voice-band-muted so dialogue
+    # bleeding into low-frequency rumble doesn't trigger spurious LFE.
+    if dsp.has_lfe and dsp.lfe_energy:
+        _lfe_full = np.array(dsp.lfe_energy, dtype=np.float64)
+        if len(_lfe_full) != n_frames:
+            _lfe_full = _resample_to_length(_lfe_full, n_frames)
+        _lfe_full = _lfe_full * voice_band_mute
+        combined = combined + settings.LFE_WEIGHT * _lfe_full
 
     video_motion = np.zeros(n_frames, dtype=np.float64)
     video_flash = np.zeros(n_frames, dtype=np.float64)
@@ -642,6 +679,21 @@ def fuse_scores(
     sharpness = np.clip(0.1 + 0.8 * band_ratio, 0.05, 0.95)
     sharpness_smooth_win = max(1, int(0.05 / frame_dur))
     sharpness = _smooth(sharpness, sharpness_smooth_win)
+
+    # ── A4: attack-time sharpness modulation ─────────────
+    # Centre attack_env around 0 (0.5 → 0 offset) so frames with
+    # fast attacks (clicks, snare, glass) push sharpness UP and
+    # decaying / steady frames pull it DOWN — matching the
+    # perceptual distinction between "crisp click" and "dull thud"
+    # that pure band balance can't capture (a snare and a kick can
+    # have similar band balance but very different attack rates).
+    if np.any(attack_env > 0):
+        _attack_smoothed = _smooth(attack_env, sharpness_smooth_win)
+        sharpness = np.clip(
+            sharpness
+            + settings.ATTACK_SHARPNESS_WEIGHT * (_attack_smoothed - 0.5),
+            0.05, 0.95,
+        )
 
     # Semantic sharpness labels are now module-level constants
     # (_CRASH_LABELS, _GUNSHOT_LABELS, _DEEP_LABELS, _TICK_LABELS)

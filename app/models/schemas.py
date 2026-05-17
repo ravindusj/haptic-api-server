@@ -82,6 +82,13 @@ class DSPFeatures(BaseModel):
     raw_rms_peak: float = 0.0
     raw_rms_array: list[float] = []
 
+    # A1 — dedicated LFE-channel envelope (empty when source is mono/stereo)
+    lfe_energy: list[float] = []
+    has_lfe: bool = False
+
+    # A4 — per-frame attack-rate envelope (normalised onset derivative)
+    attack_envelope: list[float] = []
+
     beat_times: list[float]
     beat_strengths: list[float]
 

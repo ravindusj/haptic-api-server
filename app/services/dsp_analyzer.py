@@ -13,8 +13,17 @@ logger = logging.getLogger(__name__)
 settings = get_settings()
 
 
-def analyze_dsp(wav_path: str) -> DSPFeatures:
-    """Run full DSP feature extraction: HPSS, multi-band energies, beat tracking."""
+def analyze_dsp(
+    wav_path: str,
+    lfe_wav_path: str | None = None,
+) -> DSPFeatures:
+    """Run full DSP feature extraction: HPSS, multi-band energies, beat tracking.
+
+    When ``lfe_wav_path`` is provided (A1), the LFE channel is also
+    loaded and its RMS envelope is included in the returned features
+    as a separate ``lfe_energy`` array for the scorer to use as a
+    sub-bass haptic ground truth.
+    """
     sr = settings.AUDIO_SAMPLE_RATE
     hop = settings.HOP_LENGTH
 
@@ -72,10 +81,40 @@ def analyze_dsp(wav_path: str) -> DSPFeatures:
     percussive_norm = _pad_or_trim(percussive_norm, n_frames)
     onset_norm = _pad_or_trim(onset_norm, n_frames)
 
+    # ── A4: attack-rate envelope (per frame, normalised) ──
+    # Positive derivative of the percussive-onset envelope.  Sharp
+    # rises (clicks, snare hits) produce high values; slow rises
+    # (sustained bass swells) produce low values.  The scorer blends
+    # this into sharpness so the perceived "crispness" of each tap
+    # matches the underlying attack envelope, not just band balance.
+    attack_env = _compute_attack_envelope(percussive_onset, frame_dur=frame_dur)
+    attack_env = _pad_or_trim(attack_env, n_frames)
+
+    # ── A1: LFE channel envelope (optional) ──
+    lfe_energy: list[float] = []
+    has_lfe = False
+    if lfe_wav_path:
+        try:
+            y_lfe, _ = librosa.load(lfe_wav_path, sr=sr, mono=True)
+            lfe_rms = librosa.feature.rms(y=y_lfe, hop_length=hop)[0]
+            lfe_norm = _normalise(lfe_rms, frame_dur=frame_dur)
+            lfe_norm = _pad_or_trim(lfe_norm, n_frames)
+            lfe_energy = lfe_norm.tolist()
+            has_lfe = True
+            logger.info(
+                "LFE energy loaded: %d frames, mean=%.3f peak=%.3f",
+                len(lfe_energy), float(np.mean(lfe_norm)), float(np.max(lfe_norm)),
+            )
+        except Exception as e:
+            logger.warning("LFE load failed (continuing without LFE): %s", e)
+
     logger.info(
-        "DSP analysis complete: %d frames, %d beats, HPSS + 6-band",
+        "DSP analysis complete: %d frames, %d beats, HPSS + 6-band, "
+        "lfe=%s, attack-env max=%.3f",
         n_frames,
         len(beat_times),
+        "yes" if has_lfe else "no",
+        float(np.max(attack_env)) if len(attack_env) else 0.0,
     )
 
     return DSPFeatures(
@@ -98,9 +137,43 @@ def analyze_dsp(wav_path: str) -> DSPFeatures:
         raw_rms_mean=round(raw_rms_mean, 6),
         raw_rms_peak=round(raw_rms_peak, 6),
         raw_rms_array=rms.tolist(),
+        lfe_energy=lfe_energy,
+        has_lfe=has_lfe,
+        attack_envelope=[round(float(v), 4) for v in attack_env],
         beat_times=[round(float(t), 4) for t in beat_times],
         beat_strengths=[round(float(s), 4) for s in beat_strengths],
     )
+
+
+def _compute_attack_envelope(
+    onset_strength: np.ndarray,
+    frame_dur: float,
+) -> np.ndarray:
+    """Per-frame attack-rate envelope (A4).
+
+    Defined as the positive derivative of the onset-strength envelope,
+    smoothed over ~30 ms and normalised to [0, 1] by the 98th
+    percentile.  Frames with rapidly *rising* onset energy
+    (clicks / snare / glass shatter) score high; frames in steady or
+    decaying regions score low.
+    """
+    if len(onset_strength) < 2:
+        return np.zeros_like(onset_strength)
+
+    diff = np.diff(onset_strength, prepend=onset_strength[0])
+    rising = np.maximum(diff, 0.0)
+
+    # Smooth over ~30 ms to denoise single-sample spikes while still
+    # preserving sub-100 ms attack character.
+    smooth_n = max(1, int(0.030 / max(frame_dur, 1e-6)))
+    if smooth_n > 1:
+        kernel = np.ones(smooth_n, dtype=np.float64) / smooth_n
+        rising = np.convolve(rising, kernel, mode="same")
+
+    peak = float(np.percentile(rising, 98)) if len(rising) > 0 else 0.0
+    if peak < 1e-9:
+        return np.zeros_like(rising)
+    return np.clip(rising / peak, 0.0, 1.0)
 
 
 def _normalise(
